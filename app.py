@@ -102,6 +102,15 @@ with st.sidebar:
         manual_urls = [u.strip() for u in raw.splitlines() if u.strip().startswith("http")]
         limit = 0
 
+    if check_type == "🔗 リンクチェック":
+        toyota_only = st.checkbox(
+            "toyota.jpリンクのみ",
+            value=True,
+            help="toyota.jpドメイン以外のリンクをチェック対象から除外（高速化）",
+        )
+    else:
+        toyota_only = False
+
     if check_type == "⚡ Core Web Vitals":
         strategy = st.radio("計測デバイス", ["mobile", "desktop"], horizontal=True)
         psi_key = st.text_input("PSI API Key（任意）",
@@ -201,48 +210,94 @@ if check_type == "📄 タイトル取得":
 # ════════════════════════════════════════
 elif check_type == "🔗 リンクチェック":
     from concurrent.futures import ThreadPoolExecutor, as_completed
+    from fetcher import extract_links
+    from urllib.parse import urlparse
 
-    results = []
-    progress = st.progress(0, text="チェック中...")
+    # Phase 1: 各ページのリンクを収集
+    st.caption("Phase 1/2 — ページ内リンクを収集中")
+    progress1 = st.progress(0, text="収集中...")
+    page_links: dict = {}
 
-    def _check(url):
-        code, _ = fetch_html(url)
-        broken = code in (404, 410) or code == 0
-        return {
-            "URL": url,
-            "ステータス": code,
-            "判定": "❌ リンク切れ" if broken else ("✅ 正常" if code in (200, 301, 302) else f"⚠️ {code}"),
-            "リンク切れ": broken,
-        }
+    def _collect(url):
+        code, html = fetch_html(url)
+        links = extract_links(html, url) if (code == 200 and html) else []
+        if toyota_only:
+            links = [l for l in links if urlparse(l).netloc == "toyota.jp"]
+        return url, code, links
 
     with ThreadPoolExecutor(max_workers=CONCURRENT_WORKERS) as ex:
-        futures = {ex.submit(_check, u): u for u in urls}
+        futs = {ex.submit(_collect, u): u for u in urls}
         done = 0
-        for future in as_completed(futures):
-            results.append(future.result())
+        for f in as_completed(futs):
+            src, code, links = f.result()
+            page_links[src] = {"status": code, "links": links}
             done += 1
-            progress.progress(done / len(urls), text=f"チェック中... {done}/{len(urls)}")
+            progress1.progress(done / len(urls), text=f"リンク収集中... {done}/{len(urls)}")
             time.sleep(REQUEST_DELAY)
+    progress1.empty()
 
-    progress.empty()
-    df = pd.DataFrame(results)
-    broken_df = df[df["リンク切れ"] == True]
+    all_links = list({lnk for d in page_links.values() for lnk in d["links"]})
+    st.caption(f"Phase 2/2 — 発見リンク {len(all_links)} 件のステータスを確認中")
 
+    # Phase 2: 収集したリンクのステータスチェック
+    progress2 = st.progress(0, text="チェック中...")
+    link_status: dict = {}
+
+    def _ping(url):
+        code, _ = fetch_html(url)
+        return url, code
+
+    with ThreadPoolExecutor(max_workers=CONCURRENT_WORKERS) as ex:
+        futs = {ex.submit(_ping, u): u for u in all_links}
+        done = 0
+        for f in as_completed(futs):
+            url, code = f.result()
+            link_status[url] = code
+            done += 1
+            progress2.progress(done / len(all_links), text=f"確認中... {done}/{len(all_links)}")
+            time.sleep(REQUEST_DELAY)
+    progress2.empty()
+
+    # Phase 3: 発見ページ × リンクURL で集計
+    broken_rows = []
+    all_rows = []
+    for src in sorted(page_links):
+        d = page_links[src]
+        for lnk in d["links"]:
+            code = link_status.get(lnk, 0)
+            broken = code in (404, 410) or code == 0
+            row = {
+                "発見ページ": src,
+                "リンクURL": lnk,
+                "ドメイン": urlparse(lnk).netloc,
+                "ステータス": code,
+                "判定": "❌ リンク切れ" if broken else "✅ 正常",
+            }
+            all_rows.append(row)
+            if broken:
+                broken_rows.append(row)
+
+    broken_pages = len({r["発見ページ"] for r in broken_rows})
     col1, col2, col3 = st.columns(3)
-    col1.metric("✅ 正常", len(df[df["判定"].str.startswith("✅")]))
-    col2.metric("❌ リンク切れ", len(broken_df))
-    col3.metric("⚠️ 要確認", len(df[df["判定"].str.startswith("⚠️")]))
+    col1.metric("対象ページ数", len(urls))
+    col2.metric("❌ リンク切れページ数", broken_pages)
+    col3.metric("❌ リンク切れ件数", len(broken_rows))
 
-    if len(broken_df):
-        st.error("リンク切れが検出されました")
+    if broken_rows:
+        st.error(f"リンク切れ: {len(broken_rows)} 件（{broken_pages} ページで発見）")
         st.subheader("❌ リンク切れ一覧")
-        st.dataframe(broken_df[["URL", "ステータス"]], use_container_width=True)
+        df_broken = pd.DataFrame(broken_rows)
+        st.dataframe(df_broken, use_container_width=True, height=400)
+        st.download_button("📥 リンク切れExcelダウンロード", to_excel_bytes(df_broken),
+                           "links_broken.xlsx", use_container_width=True)
+    else:
+        st.success("リンク切れは検出されませんでした ✅")
 
-    with st.expander("全件表示"):
-        st.dataframe(df[["URL", "ステータス", "判定"]], use_container_width=True, height=400)
-
-    st.download_button("📥 Excelダウンロード", to_excel_bytes(df[["URL", "ステータス", "判定"]]),
-                       "links_result.xlsx", use_container_width=True)
+    with st.expander(f"全リンク一覧（{len(all_rows)} 件）"):
+        df_all = pd.DataFrame(all_rows)
+        st.dataframe(df_all, use_container_width=True, height=400)
+        st.download_button("📥 全件Excelダウンロード", to_excel_bytes(df_all),
+                           "links_all.xlsx", use_container_width=True, key="dl_all")
 
 # ════════════════════════════════════════
 # ⚡ Core Web Vitals
