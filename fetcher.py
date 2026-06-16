@@ -100,6 +100,41 @@ def extract_resources(html: str, base_url: str) -> list[tuple[str, str]]:
         for m in re.finditer(pattern, html, re.I):
             _add(m.group(1), rtype)
 
+    # インラインstyle属性内のurl()
+    for m in re.finditer(r'style="[^"]*url\(["\']?([^"\')\s]+)["\']?\)', html, re.I):
+        _add(m.group(1), "画像(インラインCSS)")
+
+    return results
+
+
+def extract_css_urls(css_text: str, base_url: str) -> list[tuple[str, str]]:
+    """CSSテキスト内のurl()参照を (url, 種別) で返す"""
+    from urllib.parse import urljoin, urlparse
+
+    SKIP = ("data:", "#")
+    seen: set[str] = set()
+    results: list[tuple[str, str]] = []
+
+    for m in re.finditer(r'url\(\s*["\']?([^"\')\s]+)["\']?\s*\)', css_text, re.I):
+        href = m.group(1).strip()
+        if any(href.startswith(p) for p in SKIP):
+            continue
+        abs_url = urljoin(base_url, href)
+        parsed = urlparse(abs_url)
+        if parsed.scheme not in ("http", "https"):
+            continue
+        if abs_url in seen:
+            continue
+        seen.add(abs_url)
+        path = parsed.path.lower()
+        if any(path.endswith(ext) for ext in (".woff", ".woff2", ".ttf", ".eot", ".otf")):
+            rtype = "フォント(CSS)"
+        elif any(path.endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".avif")):
+            rtype = "画像(CSS)"
+        else:
+            rtype = "CSSリソース"
+        results.append((abs_url, rtype))
+
     return results
 
 

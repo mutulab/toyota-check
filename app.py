@@ -210,17 +210,25 @@ if check_type == "📄 タイトル取得":
 # ════════════════════════════════════════
 elif check_type == "🔗 リンクチェック":
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    from fetcher import extract_resources
+    from fetcher import extract_resources, extract_css_urls
     from urllib.parse import urlparse
 
     # Phase 1: 各ページのリソースを収集
-    st.caption("Phase 1/2 — ページ内リソースを収集中（リンク・CSS・JS・画像・メディア）")
+    st.caption("Phase 1/2 — ページ内リソースを収集中（リンク・CSS・JS・画像・メディア・CSSリソース）")
     progress1 = st.progress(0, text="収集中...")
     page_resources: dict = {}  # {src_url: {"status": int, "resources": [(url, type), ...]}}
 
     def _collect(url):
         code, html = fetch_html(url)
         resources = extract_resources(html, url) if (code == 200 and html) else []
+
+        # CSS/スタイルファイルを取得してurl()参照を追加
+        css_links = [u for u, t in resources if t == "CSS/スタイル"]
+        for css_url in css_links:
+            css_code, css_text = fetch_html(css_url)
+            if css_code == 200 and css_text:
+                resources.extend(extract_css_urls(css_text, css_url))
+
         if toyota_only:
             resources = [(u, t) for u, t in resources if urlparse(u).netloc == "toyota.jp"]
         return url, code, resources
