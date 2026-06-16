@@ -83,10 +83,17 @@ with st.sidebar:
 
     st.divider()
     st.subheader("URL ソース")
-    url_source = st.radio("", ["Excelファイルをアップロード", "URLを直接入力"], label_visibility="collapsed")
+    url_source = st.radio(
+        "",
+        ["Excelファイルをアップロード", "URLを直接入力", "🕷️ クロール（自動収集）"],
+        label_visibility="collapsed",
+    )
 
     uploaded_file = None
     manual_urls = []
+    crawl_start = ""
+    crawl_max = 100
+    crawl_depth = 2
 
     if url_source == "Excelファイルをアップロード":
         uploaded_file = st.file_uploader(
@@ -96,10 +103,26 @@ with st.sidebar:
         )
         limit = st.slider("上限URL数（0=全件）", 0, 200, 0,
                           help="テスト時は10〜20程度に設定推奨")
-    else:
+    elif url_source == "URLを直接入力":
         raw = st.text_area("URLを1行ずつ入力", height=200,
                            placeholder="https://toyota.jp/alphard/\nhttps://toyota.jp/prius/")
         manual_urls = [u.strip() for u in raw.splitlines() if u.strip().startswith("http")]
+        limit = 0
+    else:  # クロール
+        crawl_start = st.text_input(
+            "開始URL",
+            value="https://toyota.jp/",
+            placeholder="https://toyota.jp/",
+        )
+        crawl_max = st.slider(
+            "最大収集ページ数", 10, 500, 100,
+            help="大きいほど時間がかかります。まず50前後で試してください",
+        )
+        crawl_depth = st.number_input(
+            "クロール深さ（階層数）",
+            min_value=1, max_value=4, value=2,
+            help="1=開始ページのリンクのみ / 2=その先も辿る / 3以上は時間大",
+        )
         limit = 0
 
     if check_type == "🔗 リンクチェック":
@@ -163,8 +186,56 @@ if url_source == "Excelファイルをアップロード":
         urls = load_urls_from_excel(uploaded_file)
     if limit:
         urls = urls[:limit]
-else:
+
+elif url_source == "URLを直接入力":
     urls = manual_urls
+
+else:  # 🕷️ クロール
+    from urllib.parse import urlparse
+    from collections import deque
+    from fetcher import extract_links as _extract_links
+
+    if not crawl_start or not crawl_start.startswith("http"):
+        st.error("クロール開始URLを入力してください。")
+        st.stop()
+
+    base_domain = urlparse(crawl_start).netloc
+    visited: set = set()
+    queue: deque = deque([(crawl_start.rstrip("/"), 0)])
+    urls: list = []
+
+    st.info(f"**{crawl_start}** からクロール中（最大 {crawl_max} ページ、深さ {crawl_depth}）")
+    crawl_progress = st.progress(0, text="クロール中...")
+    crawl_status = st.empty()
+
+    while queue and len(urls) < crawl_max:
+        url, depth = queue.popleft()
+        norm = url.rstrip("/").split("?")[0].split("#")[0]
+        if norm in visited:
+            continue
+        visited.add(norm)
+
+        code, html = fetch_html(url)
+        if code == 200 and html:
+            urls.append(url)
+            crawl_progress.progress(
+                min(len(urls) / crawl_max, 1.0),
+                text=f"収集中... {len(urls)} / {crawl_max} ページ",
+            )
+            crawl_status.caption(f"→ {url}")
+
+            if depth < crawl_depth:
+                for link in _extract_links(html, url):
+                    if urlparse(link).netloc == base_domain:
+                        clean = link.rstrip("/").split("?")[0].split("#")[0]
+                        if clean not in visited:
+                            queue.append((link, depth + 1))
+
+        time.sleep(REQUEST_DELAY)
+
+    crawl_progress.empty()
+    crawl_status.empty()
+    st.success(f"クロール完了: **{len(urls)} ページ**を収集しました")
 
 if not urls:
     st.error("URLが見つかりません。")
