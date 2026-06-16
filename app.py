@@ -254,10 +254,35 @@ if check_type == "🕷️ バックグラウンドクロール":
             st.info("ブラウザを閉じても処理は継続します。「ジョブ確認」タブでステータスを確認してください。")
 
     with tab_status:
-        st.subheader("ジョブステータス確認")
-        default_id = st.session_state.get("bg_job_id", "")
-        job_id_input = st.text_input("ジョブID", value=default_id,
-                                     placeholder="例: A1B2C3D4").strip().upper()
+        # ── ジョブ選択（履歴 or 直接入力） ───────────────────────────
+        recent = _cw.list_jobs()
+        job_id_input = ""
+
+        if recent:
+            _NONE = "— IDを直接入力 —"
+            _opts: dict = {
+                f"{j['id']}  [{j['status']}]  {j['cfg']['start_url']}  ({j['started_at'][:16]})": j["id"]
+                for j in recent
+            }
+            _all_keys = [_NONE] + list(_opts.keys())
+            _sess_id = st.session_state.get("bg_job_id", "")
+            _def_key = next((k for k, v in _opts.items() if v == _sess_id), _NONE)
+            _sel = st.selectbox(
+                "📋 ジョブ履歴から選択",
+                _all_keys,
+                index=_all_keys.index(_def_key),
+            )
+            if _sel != _NONE:
+                job_id_input = _opts[_sel]
+
+        if not job_id_input:
+            job_id_input = st.text_input(
+                "ジョブIDを直接入力",
+                value=st.session_state.get("bg_job_id", ""),
+                placeholder="例: A1B2C3D4",
+            ).strip().upper()
+
+        # ── ジョブ詳細 ────────────────────────────────────────────────
         if job_id_input:
             job = _cw.get_job(job_id_input)
             if not job:
@@ -312,17 +337,6 @@ if check_type == "🕷️ バックグラウンドクロール":
                             st.dataframe(df_w, use_container_width=True, height=300)
                             st.download_button("📥 CWV Excel", to_excel_bytes(df_w),
                                                f"cwv_{job_id_input}.xlsx", key="bg_dl_wx")
-
-        st.divider()
-        st.subheader("最近のジョブ一覧")
-        recent = _cw.list_jobs()
-        if recent:
-            df_jobs = pd.DataFrame([{
-                "ID": j["id"], "ステータス": j["status"],
-                "フェーズ": j["phase"], "収集数": j.get("url_count", 0),
-                "進捗": f"{j['progress']}%", "開始": j["started_at"][:16],
-            } for j in recent])
-            st.dataframe(df_jobs, use_container_width=True)
     st.stop()
 
 # ─── URL 収集（通常モード） ──────────────────────────────────────────
