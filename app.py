@@ -330,6 +330,11 @@ if check_type == "🕷️ バックグラウンドクロール":
                                                f"cwv_{job_id_input}.xlsx", key="bg_dl_wx")
     st.stop()
 
+# ─── 通常モード: ボタンを押すまで待機 ──────────────────────────────
+if not run_btn:
+    st.info("サイドバーで設定を入力し「▶ チェック実行」を押してください。")
+    st.stop()
+
 # ─── URL 収集（通常モード） ──────────────────────────────────────────
 if url_source == "Excelファイルをアップロード":
     if not uploaded_file:
