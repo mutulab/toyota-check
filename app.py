@@ -221,37 +221,29 @@ with st.sidebar:
     st.divider()
     run_btn = st.button("▶ チェック実行", type="primary", use_container_width=True)
 
-# ─── メインエリア ────────────────────────────────────
-if not run_btn:
-    st.info("サイドバーで設定を選び「チェック実行」を押してください。")
-
-    with st.expander("📌 使い方"):
-        st.markdown("""
-| コマンド | 内容 |
-|---|---|
-| 📄 タイトル取得 | 全URLのtitle・descriptionを取得 |
-| 🔗 リンクチェック | 404・リンク切れを検出 |
-| ⚡ Core Web Vitals | LCP/CLS/INP をTQP KPIと照合 |
-| 📝 表記ゆれ・禁止表現 | 景表法・誇大表現・表記ゆれを検出 |
-
-**TQP KPI 閾値**
-- LCP ≤ 2.5s　CLS ≤ 0.1　INP ≤ 200ms
-        """)
-    st.stop()
-
-# ─── バックグラウンドクロール UI（通常フローをスキップ） ────────────
+# ─── バックグラウンドクロール UI（常時表示 / 通常フローをスキップ） ──
 if check_type == "🕷️ バックグラウンドクロール":
-    import crawler as _cw
+    try:
+        import crawler as _cw
+    except Exception as _e:
+        st.error(f"crawler モジュールの読み込みに失敗しました: {_e}")
+        st.stop()
+
     tab_new, tab_status = st.tabs(["▶ 新規ジョブ開始", "🔍 ジョブ確認"])
 
     with tab_new:
-        st.subheader("バックグラウンドクロール設定確認")
+        st.subheader("ジョブ設定")
         st.json({k: v for k, v in bg_cfg.items() if k != "psi_key"})
-        if st.button("🚀 ジョブ開始", type="primary"):
-            jid = _cw.start_job(bg_cfg)
-            st.session_state["bg_job_id"] = jid
-            st.success(f"ジョブを開始しました。**ジョブID: `{jid}`**")
-            st.info("ブラウザを閉じても処理は継続します。「ジョブ確認」タブでステータスを確認してください。")
+        if run_btn:  # サイドバーの「▶ チェック実行」= ジョブ開始
+            try:
+                jid = _cw.start_job(bg_cfg)
+                st.session_state["bg_job_id"] = jid
+                st.success(f"ジョブを開始しました。**ジョブID: `{jid}`**")
+                st.info("ブラウザを閉じても処理は継続します。「🔍 ジョブ確認」タブで結果を確認してください。")
+            except Exception as _e:
+                st.error(f"ジョブ開始に失敗しました: {_e}")
+        else:
+            st.info("設定を確認して、サイドバーの「▶ チェック実行」を押すとジョブが開始されます。")
 
     with tab_status:
         # ── ジョブ選択（履歴 or 直接入力） ───────────────────────────
@@ -299,10 +291,9 @@ if check_type == "🕷️ バックグラウンドクロール":
                     st.error(f"エラー: {job.get('error', '')}")
 
                 if job["status"] == "running":
+                    st.info("実行中です。完了したら「🔄 更新」を押してください。")
                     if st.button("🔄 更新"):
                         st.rerun()
-                    time.sleep(3)
-                    st.rerun()
 
                 if job["status"] == "done":
                     res = job.get("results", {})
