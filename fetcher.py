@@ -53,7 +53,7 @@ def extract_meta(html: str) -> dict:
 
 
 def extract_links(html: str, base_url: str) -> list[str]:
-    """ページ内の全リンクを絶対URLで返す"""
+    """ページ内の<a href>リンクを絶対URLで返す"""
     from urllib.parse import urljoin, urlparse
     import re as _re
 
@@ -66,7 +66,41 @@ def extract_links(html: str, base_url: str) -> list[str]:
         parsed = urlparse(abs_url)
         if parsed.scheme in ("http", "https"):
             links.append(abs_url)
-    return list(dict.fromkeys(links))  # 重複除去
+    return list(dict.fromkeys(links))
+
+
+def extract_resources(html: str, base_url: str) -> list[tuple[str, str]]:
+    """ページ内の全リソース（リンク・CSS・JS・画像・メディア）を (url, 種別) で返す"""
+    from urllib.parse import urljoin, urlparse
+
+    SKIP = ("mailto:", "tel:", "javascript:", "data:")
+    seen: set[str] = set()
+    results: list[tuple[str, str]] = []
+
+    def _add(href: str, rtype: str) -> None:
+        if not href or any(href.startswith(p) for p in SKIP):
+            return
+        abs_url = urljoin(base_url, href.split("#")[0])
+        if urlparse(abs_url).scheme not in ("http", "https"):
+            return
+        if abs_url not in seen:
+            seen.add(abs_url)
+            results.append((abs_url, rtype))
+
+    patterns = [
+        (r'<a[^>]+href="([^"]*)"',              "リンク"),
+        (r'<link[^>]+href="([^"]*)"',            "CSS/スタイル"),
+        (r'<script[^>]+src="([^"]*)"',           "JavaScript"),
+        (r'<img[^>]+src="([^"]*)"',              "画像"),
+        (r'<source[^>]+src="([^"]*)"',           "メディア"),
+        (r'<(?:video|audio)[^>]+src="([^"]*)"',  "メディア"),
+        (r'<iframe[^>]+src="([^"]*)"',           "iframe"),
+    ]
+    for pattern, rtype in patterns:
+        for m in re.finditer(pattern, html, re.I):
+            _add(m.group(1), rtype)
+
+    return results
 
 
 def extract_text_blocks(html: str) -> list[str]:
