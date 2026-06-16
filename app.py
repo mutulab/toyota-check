@@ -77,84 +77,146 @@ with st.sidebar:
 
     check_type = st.radio(
         "チェック種別",
-        ["📄 タイトル取得", "🔗 リンクチェック", "⚡ Core Web Vitals", "📝 表記ゆれ・禁止表現"],
+        ["📄 タイトル取得", "🔗 リンクチェック", "⚡ Core Web Vitals",
+         "📝 表記ゆれ・禁止表現", "🕷️ バックグラウンドクロール"],
         index=0,
     )
 
-    st.divider()
-    st.subheader("URL ソース")
-    url_source = st.radio(
-        "",
-        ["Excelファイルをアップロード", "URLを直接入力", "🕷️ クロール（自動収集）"],
-        label_visibility="collapsed",
-    )
-
-    uploaded_file = None
-    manual_urls = []
-    crawl_start = ""
-    crawl_max = 100
-    crawl_depth = 2
-
-    if url_source == "Excelファイルをアップロード":
-        uploaded_file = st.file_uploader(
-            "tjpコンテンツ管理表.xlsx",
-            type=["xlsx"],
-            help="「運用サイトマップ」シートのフルURL列を読み込みます",
-        )
-        limit = st.slider("上限URL数（0=全件）", 0, 200, 0,
-                          help="テスト時は10〜20程度に設定推奨")
-    elif url_source == "URLを直接入力":
-        raw = st.text_area("URLを1行ずつ入力", height=200,
-                           placeholder="https://toyota.jp/alphard/\nhttps://toyota.jp/prius/")
-        manual_urls = [u.strip() for u in raw.splitlines() if u.strip().startswith("http")]
-        limit = 0
-    else:  # クロール
-        crawl_start = st.text_input(
-            "開始URL",
-            value="https://toyota.jp/",
-            placeholder="https://toyota.jp/",
-        )
-        crawl_max = st.slider(
-            "最大収集ページ数", 10, 500, 100,
-            help="大きいほど時間がかかります。まず50前後で試してください",
-        )
-        crawl_depth = st.number_input(
-            "クロール深さ（階層数）",
-            min_value=1, max_value=4, value=2,
-            help="1=開始ページのリンクのみ / 2=その先も辿る / 3以上は時間大",
-        )
-        limit = 0
-
-    if check_type == "🔗 リンクチェック":
-        toyota_only = st.checkbox(
-            "toyota.jpリンクのみ",
-            value=True,
-            help="toyota.jpドメイン以外のリンクをチェック対象から除外（高速化）",
-        )
-    else:
-        toyota_only = False
-
-    if check_type == "📝 表記ゆれ・禁止表現":
+    # ── バックグラウンドクロール専用設定 ──────────────────────────────
+    bg_cfg: dict = {}
+    if check_type == "🕷️ バックグラウンドクロール":
         st.divider()
-        st.subheader("カスタム辞書")
-        custom_dict_raw = st.text_area(
-            "追加する表記ゆれ（1行1件: 誤表記|推奨表記）",
-            height=130,
-            placeholder="ウエブサイト|WEBサイト\nお問合せ|お問い合わせ\nログアウト|ログアウト（統一）",
-            help="デフォルト辞書に加えて独自チェック項目を追加。正規表現も使用可。",
+        st.subheader("ジョブ設定")
+        bg_cfg["start_url"]    = st.text_input("開始URL", value="https://toyota.jp/")
+        bg_cfg["max_pages"]    = st.slider("最大収集ページ数", 10, 500, 100)
+        bg_cfg["depth"]        = int(st.number_input("クロール深さ", 1, 4, 2))
+        bg_cfg["toyota_only"]  = st.checkbox("toyota.jpリンクのみ", value=True)
+        _bg_checks = st.multiselect(
+            "実行するチェック",
+            ["リンクチェック", "表記ゆれ・禁止表現", "Core Web Vitals"],
+            default=["リンクチェック"],
         )
-    else:
+        _map = {"リンクチェック": "link", "表記ゆれ・禁止表現": "content", "Core Web Vitals": "cwv"}
+        bg_cfg["check_types"] = [_map[c] for c in _bg_checks]
+        if "link" in bg_cfg["check_types"]:
+            st.caption("リンクチェック: リソース種別")
+            c1, c2 = st.columns(2)
+            _sel: set = set()
+            if c1.checkbox("リンク(<a>)",   value=True,  key="bg_rl"): _sel.add("リンク")
+            if c1.checkbox("CSS",           value=True,  key="bg_rc"): _sel.add("CSS/スタイル")
+            if c1.checkbox("JavaScript",    value=True,  key="bg_rj"): _sel.add("JavaScript")
+            if c2.checkbox("画像",          value=True,  key="bg_ri"): _sel.update({"画像", "画像(インラインCSS)"})
+            if c2.checkbox("メディア",      value=False, key="bg_rm"): _sel.add("メディア")
+            if c2.checkbox("iframe",        value=False, key="bg_rf"): _sel.add("iframe")
+            if st.checkbox("CSS内リソース", value=False, key="bg_rcr"): _sel.update({"画像(CSS)", "フォント(CSS)", "CSSリソース"})
+            bg_cfg["selected_res"] = list(_sel)
+        if "content" in bg_cfg["check_types"]:
+            bg_cfg["custom_dict"] = st.text_area(
+                "カスタム辞書（誤表記|推奨表記）", height=80,
+                placeholder="ウエブサイト|WEBサイト", key="bg_dict",
+            )
+        if "cwv" in bg_cfg["check_types"]:
+            bg_cfg["strategy"] = st.radio("CWVデバイス", ["mobile", "desktop"],
+                                          horizontal=True, key="bg_strat")
+            bg_cfg["psi_key"]  = st.text_input("PSI API Key", type="password",
+                                               value=st.secrets.get("PSI_API_KEY", ""),
+                                               key="bg_psi")
+        # URL source 変数をデフォルト値で初期化（後続コードで参照されるため）
+        url_source = None
+        uploaded_file = None
+        manual_urls: list = []
+        crawl_start = ""
+        crawl_max = 100
+        crawl_depth = 2
+        limit = 0
+        toyota_only = False
+        selected_res_types: set = set()
         custom_dict_raw = ""
-
-    if check_type == "⚡ Core Web Vitals":
-        strategy = st.radio("計測デバイス", ["mobile", "desktop"], horizontal=True)
-        psi_key = st.text_input("PSI API Key（任意）",
-                                value=st.secrets.get("PSI_API_KEY", ""),
-                                type="password",
-                                help="未入力でも動作します（25,000回/日の上限あり）")
-    else:
         strategy = "mobile"
         psi_key = st.secrets.get("PSI_API_KEY", "")
+
+    else:
+        # ── 通常モード: URL ソース ──────────────────────────────────────
+        st.divider()
+        st.subheader("URL ソース")
+        url_source = st.radio(
+            "",
+            ["Excelファイルをアップロード", "URLを直接入力", "🕷️ クロール（自動収集）"],
+            label_visibility="collapsed",
+        )
+
+        uploaded_file = None
+        manual_urls = []
+        crawl_start = ""
+        crawl_max = 100
+        crawl_depth = 2
+
+        if url_source == "Excelファイルをアップロード":
+            uploaded_file = st.file_uploader(
+                "tjpコンテンツ管理表.xlsx",
+                type=["xlsx"],
+                help="「運用サイトマップ」シートのフルURL列を読み込みます",
+            )
+            limit = st.slider("上限URL数（0=全件）", 0, 200, 0,
+                              help="テスト時は10〜20程度に設定推奨")
+        elif url_source == "URLを直接入力":
+            raw = st.text_area("URLを1行ずつ入力", height=200,
+                               placeholder="https://toyota.jp/alphard/\nhttps://toyota.jp/prius/")
+            manual_urls = [u.strip() for u in raw.splitlines() if u.strip().startswith("http")]
+            limit = 0
+        else:  # クロール（自動収集）
+            crawl_start = st.text_input("開始URL", value="https://toyota.jp/")
+            crawl_max = st.slider("最大収集ページ数", 10, 500, 100,
+                                  help="まず50前後で試してください")
+            crawl_depth = st.number_input("クロール深さ（階層数）", min_value=1, max_value=4, value=2,
+                                          help="1=直リンクのみ / 2=その先も辿る")
+            limit = 0
+
+        # ── リンクチェック: リソース種別選択 ───────────────────────────
+        if check_type == "🔗 リンクチェック":
+            toyota_only = st.checkbox(
+                "toyota.jpリンクのみ",
+                value=True,
+                help="toyota.jpドメイン以外を除外（高速化）",
+            )
+            st.divider()
+            st.caption("チェック対象リソース種別")
+            c1, c2 = st.columns(2)
+            _sel2: set = set()
+            if c1.checkbox("リンク(<a>)",  value=True,  key="rl"): _sel2.add("リンク")
+            if c1.checkbox("CSS",          value=True,  key="rc"): _sel2.add("CSS/スタイル")
+            if c1.checkbox("JavaScript",   value=True,  key="rj"): _sel2.add("JavaScript")
+            if c2.checkbox("画像",         value=True,  key="ri"): _sel2.update({"画像", "画像(インラインCSS)"})
+            if c2.checkbox("メディア",     value=False, key="rm"): _sel2.add("メディア")
+            if c2.checkbox("iframe",       value=False, key="rf"): _sel2.add("iframe")
+            if st.checkbox("CSS内リソース（背景画像・フォント）", value=False, key="rcr"):
+                _sel2.update({"画像(CSS)", "フォント(CSS)", "CSSリソース"})
+            selected_res_types = _sel2
+        else:
+            toyota_only = False
+            selected_res_types = set()
+
+        if check_type == "📝 表記ゆれ・禁止表現":
+            st.divider()
+            st.subheader("カスタム辞書")
+            custom_dict_raw = st.text_area(
+                "追加する表記ゆれ（1行1件: 誤表記|推奨表記）",
+                height=130,
+                placeholder="ウエブサイト|WEBサイト\nお問合せ|お問い合わせ",
+                help="デフォルト辞書に加えて独自チェック項目を追加。正規表現も使用可。",
+            )
+        else:
+            custom_dict_raw = ""
+
+        if check_type == "⚡ Core Web Vitals":
+            strategy = st.radio("計測デバイス", ["mobile", "desktop"], horizontal=True)
+            psi_key = st.text_input("PSI API Key（任意）",
+                                    value=st.secrets.get("PSI_API_KEY", ""),
+                                    type="password",
+                                    help="未入力でも動作します（25,000回/日の上限あり）")
+        else:
+            strategy = "mobile"
+            psi_key = st.secrets.get("PSI_API_KEY", "")
 
     st.divider()
     run_btn = st.button("▶ チェック実行", type="primary", use_container_width=True)
@@ -177,7 +239,93 @@ if not run_btn:
         """)
     st.stop()
 
-# ─── URL 収集 ────────────────────────────────────────
+# ─── バックグラウンドクロール UI（通常フローをスキップ） ────────────
+if check_type == "🕷️ バックグラウンドクロール":
+    import crawler as _cw
+    tab_new, tab_status = st.tabs(["▶ 新規ジョブ開始", "🔍 ジョブ確認"])
+
+    with tab_new:
+        st.subheader("バックグラウンドクロール設定確認")
+        st.json({k: v for k, v in bg_cfg.items() if k != "psi_key"})
+        if st.button("🚀 ジョブ開始", type="primary"):
+            jid = _cw.start_job(bg_cfg)
+            st.session_state["bg_job_id"] = jid
+            st.success(f"ジョブを開始しました。**ジョブID: `{jid}`**")
+            st.info("ブラウザを閉じても処理は継続します。「ジョブ確認」タブでステータスを確認してください。")
+
+    with tab_status:
+        st.subheader("ジョブステータス確認")
+        default_id = st.session_state.get("bg_job_id", "")
+        job_id_input = st.text_input("ジョブID", value=default_id,
+                                     placeholder="例: A1B2C3D4").strip().upper()
+        if job_id_input:
+            job = _cw.get_job(job_id_input)
+            if not job:
+                st.error("ジョブが見つかりません。IDを確認してください。")
+            else:
+                st.progress(job["progress"] / 100, text=job["phase"])
+                col1, col2, col3 = st.columns(3)
+                col1.metric("ステータス", job["status"])
+                col2.metric("収集ページ数", job.get("url_count", 0))
+                col3.metric("進捗", f"{job['progress']}%")
+                st.caption(f"開始: {job['started_at']}　完了: {job.get('finished_at') or '—'}")
+
+                if job["status"] == "error":
+                    st.error(f"エラー: {job.get('error', '')}")
+
+                if job["status"] == "running":
+                    if st.button("🔄 更新"):
+                        st.rerun()
+                    time.sleep(3)
+                    st.rerun()
+
+                if job["status"] == "done":
+                    res = job.get("results", {})
+                    if "link" in res:
+                        df_l = pd.DataFrame(res["link"]) if res["link"] else pd.DataFrame()
+                        st.subheader(f"🔗 リンク切れ ({len(df_l)} 件)")
+                        if not df_l.empty:
+                            st.dataframe(df_l, use_container_width=True, height=300)
+                            c1, c2 = st.columns(2)
+                            c1.download_button("📥 Excel", to_excel_bytes(df_l),
+                                               f"links_{job_id_input}.xlsx", key="bg_dl_lx")
+                            c2.download_button("📥 CSV",
+                                               df_l.to_csv(index=False).encode("utf-8-sig"),
+                                               f"links_{job_id_input}.csv", mime="text/csv",
+                                               key="bg_dl_lc")
+                    if "content" in res:
+                        df_c = pd.DataFrame(res["content"]) if res["content"] else pd.DataFrame()
+                        st.subheader(f"📝 表記ゆれ・禁止表現 ({len(df_c)} 件)")
+                        if not df_c.empty:
+                            st.dataframe(df_c, use_container_width=True, height=300)
+                            c1, c2 = st.columns(2)
+                            c1.download_button("📥 指示書 Excel", to_excel_bytes(df_c),
+                                               f"content_{job_id_input}.xlsx", key="bg_dl_cx")
+                            c2.download_button("📥 指示書 CSV",
+                                               df_c.to_csv(index=False).encode("utf-8-sig"),
+                                               f"content_{job_id_input}.csv", mime="text/csv",
+                                               key="bg_dl_cc")
+                    if "cwv" in res:
+                        df_w = pd.DataFrame(res["cwv"]) if res["cwv"] else pd.DataFrame()
+                        st.subheader(f"⚡ Core Web Vitals ({len(df_w)} 件)")
+                        if not df_w.empty:
+                            st.dataframe(df_w, use_container_width=True, height=300)
+                            st.download_button("📥 CWV Excel", to_excel_bytes(df_w),
+                                               f"cwv_{job_id_input}.xlsx", key="bg_dl_wx")
+
+        st.divider()
+        st.subheader("最近のジョブ一覧")
+        recent = _cw.list_jobs()
+        if recent:
+            df_jobs = pd.DataFrame([{
+                "ID": j["id"], "ステータス": j["status"],
+                "フェーズ": j["phase"], "収集数": j.get("url_count", 0),
+                "進捗": f"{j['progress']}%", "開始": j["started_at"][:16],
+            } for j in recent])
+            st.dataframe(df_jobs, use_container_width=True)
+    st.stop()
+
+# ─── URL 収集（通常モード） ──────────────────────────────────────────
 if url_source == "Excelファイルをアップロード":
     if not uploaded_file:
         st.warning("Excelファイルをアップロードしてください。")
@@ -301,17 +449,21 @@ elif check_type == "🔗 リンクチェック":
     progress1 = st.progress(0, text="収集中...")
     page_resources: dict = {}  # {src_url: {"status": int, "resources": [(url, type), ...]}}
 
+    _css_res_types = {"画像(CSS)", "フォント(CSS)", "CSSリソース"}
+
     def _collect(url):
         code, html = fetch_html(url)
         resources = extract_resources(html, url) if (code == 200 and html) else []
 
-        # CSS/スタイルファイルを取得してurl()参照を追加
-        css_links = [u for u, t in resources if t == "CSS/スタイル"]
-        for css_url in css_links:
-            css_code, css_text = fetch_html(css_url)
-            if css_code == 200 and css_text:
-                resources.extend(extract_css_urls(css_text, css_url))
+        # CSS内リソースが選択対象の場合のみCSSファイルをフェッチ
+        if not selected_res_types or selected_res_types & _css_res_types:
+            for css_url in [u for u, t in resources if t == "CSS/スタイル"]:
+                css_code, css_text = fetch_html(css_url)
+                if css_code == 200 and css_text:
+                    resources.extend(extract_css_urls(css_text, css_url))
 
+        if selected_res_types:
+            resources = [(u, t) for u, t in resources if t in selected_res_types]
         if toyota_only:
             resources = [(u, t) for u, t in resources if urlparse(u).netloc == "toyota.jp"]
         return url, code, resources
