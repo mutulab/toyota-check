@@ -111,6 +111,18 @@ with st.sidebar:
     else:
         toyota_only = False
 
+    if check_type == "📝 表記ゆれ・禁止表現":
+        st.divider()
+        st.subheader("カスタム辞書")
+        custom_dict_raw = st.text_area(
+            "追加する表記ゆれ（1行1件: 誤表記|推奨表記）",
+            height=130,
+            placeholder="ウエブサイト|WEBサイト\nお問合せ|お問い合わせ\nログアウト|ログアウト（統一）",
+            help="デフォルト辞書に加えて独自チェック項目を追加。正規表現も使用可。",
+        )
+    else:
+        custom_dict_raw = ""
+
     if check_type == "⚡ Core Web Vitals":
         strategy = st.radio("計測デバイス", ["mobile", "desktop"], horizontal=True)
         psi_key = st.text_input("PSI API Key（任意）",
@@ -301,16 +313,24 @@ elif check_type == "🔗 リンクチェック":
         sel = st.selectbox("種別フィルタ", types)
         disp = df_broken if sel == "すべて" else df_broken[df_broken["種別"] == sel]
         st.dataframe(disp, use_container_width=True, height=400)
-        st.download_button("📥 問題リソースExcelダウンロード", to_excel_bytes(df_broken),
-                           "links_broken.xlsx", use_container_width=True)
+        c1, c2 = st.columns(2)
+        c1.download_button("📥 Excel", to_excel_bytes(df_broken),
+                           "links_broken.xlsx", use_container_width=True, key="dl_broken_xlsx")
+        c2.download_button("📥 CSV", df_broken.to_csv(index=False).encode("utf-8-sig"),
+                           "links_broken.csv", mime="text/csv",
+                           use_container_width=True, key="dl_broken_csv")
     else:
         st.success("問題のあるリソースは検出されませんでした ✅")
 
     with st.expander(f"全リソース一覧（{len(all_rows)} 件）"):
         df_all = pd.DataFrame(all_rows)
         st.dataframe(df_all, use_container_width=True, height=400)
-        st.download_button("📥 全件Excelダウンロード", to_excel_bytes(df_all),
-                           "links_all.xlsx", use_container_width=True, key="dl_all")
+        ca, cb = st.columns(2)
+        ca.download_button("📥 全件Excel", to_excel_bytes(df_all),
+                           "links_all.xlsx", use_container_width=True, key="dl_all_xlsx")
+        cb.download_button("📥 全件CSV", df_all.to_csv(index=False).encode("utf-8-sig"),
+                           "links_all.csv", mime="text/csv",
+                           use_container_width=True, key="dl_all_csv")
 
 # ════════════════════════════════════════
 # ⚡ Core Web Vitals
@@ -386,8 +406,16 @@ elif check_type == "⚡ Core Web Vitals":
 elif check_type == "📝 表記ゆれ・禁止表現":
     import re
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    from fetcher import extract_text_blocks
+    from fetcher import extract_meta, extract_text_blocks
     from config import HYOKI_YURE, KINSHI_PATTERNS
+
+    # デフォルト辞書 + カスタム辞書をマージ
+    merged_dict = dict(HYOKI_YURE)
+    for line in custom_dict_raw.splitlines():
+        line = line.strip()
+        if "|" in line:
+            wrong, correct = line.split("|", 1)
+            merged_dict[re.escape(wrong.strip())] = correct.strip()
 
     results = []
     progress = st.progress(0, text="解析中...")
@@ -395,17 +423,37 @@ elif check_type == "📝 表記ゆれ・禁止表現":
     def _content(url):
         code, html = fetch_html(url)
         if code != 200 or not html:
-            return {"URL": url, "ステータス": code, "表記ゆれ": "", "禁止表現": "", "判定": "❌"}
+            return {"url": url, "code": code, "title": "", "findings": [], "判定": "❌ 取得失敗"}
+        meta = extract_meta(html)
         text = " ".join(extract_text_blocks(html))
-        yure = [f"{list(set(re.findall(p, text, re.I)))[:2]}→{c}"
-                for p, c in HYOKI_YURE.items() if re.search(p, text, re.I)]
-        kinshi = [f"{list(set(re.findall(p, text)))[:2]}({r})"
-                  for p, r in KINSHI_PATTERNS if re.search(p, text)]
+        findings = []
+
+        for pattern, recommended in merged_dict.items():
+            for match in sorted(set(re.findall(pattern, text, re.I))):
+                findings.append({
+                    "URL": url,
+                    "ページタイトル": meta["short_title"],
+                    "種別": "表記ゆれ",
+                    "発見テキスト": match,
+                    "推奨表記": recommended,
+                    "修正済み": "",
+                })
+
+        for pattern, reason in KINSHI_PATTERNS:
+            for match in sorted(set(re.findall(pattern, text))):
+                findings.append({
+                    "URL": url,
+                    "ページタイトル": meta["short_title"],
+                    "種別": "禁止表現",
+                    "発見テキスト": match,
+                    "推奨表記": f"【要確認】{reason}",
+                    "修正済み": "",
+                })
+
         return {
-            "URL": url, "ステータス": code,
-            "表記ゆれ": " / ".join(yure),
-            "禁止表現": " / ".join(kinshi),
-            "判定": "⚠️ 要確認" if (yure or kinshi) else "✅",
+            "url": url, "code": code, "title": meta["short_title"],
+            "findings": findings,
+            "判定": "⚠️ 要確認" if findings else "✅",
         }
 
     with ThreadPoolExecutor(max_workers=CONCURRENT_WORKERS) as ex:
@@ -418,19 +466,58 @@ elif check_type == "📝 表記ゆれ・禁止表現":
             time.sleep(REQUEST_DELAY)
 
     progress.empty()
-    df = pd.DataFrame(results)
-    ng_df = df[df["判定"] == "⚠️ 要確認"]
 
-    col1, col2 = st.columns(2)
-    col1.metric("✅ 問題なし", len(df[df["判定"] == "✅"]))
-    col2.metric("⚠️ 要確認", len(ng_df))
+    # ページ単位サマリ
+    summary_rows = [{
+        "URL": r["url"],
+        "ページタイトル": r["title"],
+        "ステータス": r["code"],
+        "表記ゆれ件数": sum(1 for f in r["findings"] if f["種別"] == "表記ゆれ"),
+        "禁止表現件数": sum(1 for f in r["findings"] if f["種別"] == "禁止表現"),
+        "判定": r["判定"],
+    } for r in results]
 
-    if len(ng_df):
-        st.subheader("⚠️ 要確認ページ")
-        st.dataframe(ng_df, use_container_width=True)
+    # 指示書（1指摘1行）
+    all_findings = sorted(
+        [f for r in results for f in r["findings"]],
+        key=lambda x: (x["種別"], x["URL"])
+    )
+    instruction_rows = [{"No.": i, **f} for i, f in enumerate(all_findings, 1)]
 
-    with st.expander("全件表示"):
-        st.dataframe(df, use_container_width=True, height=400)
+    df_summary = pd.DataFrame(summary_rows)
+    ng_count = len([r for r in results if r["判定"] == "⚠️ 要確認"])
 
-    st.download_button("📥 Excelダウンロード", to_excel_bytes(df),
-                       "content_result.xlsx", use_container_width=True)
+    col1, col2, col3 = st.columns(3)
+    col1.metric("✅ 問題なし", len(results) - ng_count)
+    col2.metric("⚠️ 要確認ページ", ng_count)
+    col3.metric("📋 指摘件数合計", len(instruction_rows))
+
+    st.subheader("ページ単位サマリ")
+    st.dataframe(df_summary, use_container_width=True, height=350)
+
+    if instruction_rows:
+        st.subheader("📋 修正指示書")
+        df_inst = pd.DataFrame(instruction_rows)
+
+        kinds = ["すべて"] + sorted(df_inst["種別"].unique().tolist())
+        sel_kind = st.selectbox("種別フィルタ", kinds)
+        disp_inst = df_inst if sel_kind == "すべて" else df_inst[df_inst["種別"] == sel_kind]
+        st.dataframe(disp_inst, use_container_width=True, height=420)
+
+        c1, c2 = st.columns(2)
+        c1.download_button(
+            "📥 指示書 Excel",
+            to_excel_bytes(df_inst),
+            "修正指示書.xlsx",
+            use_container_width=True,
+        )
+        c2.download_button(
+            "📥 指示書 CSV",
+            df_inst.to_csv(index=False).encode("utf-8-sig"),
+            "修正指示書.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="dl_inst_csv",
+        )
+    else:
+        st.success("問題のある表現は検出されませんでした ✅")
