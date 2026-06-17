@@ -10,7 +10,7 @@ from config import HEADERS, REQUEST_TIMEOUT
 
 def fetch_html(url: str) -> tuple[int, str]:
     """URLを取得してHTTPステータスとHTMLを返す"""
-    req = urllib.request.Request(url, headers=HEADERS)
+    req = urllib.request.Request(_encode_url(url), headers=HEADERS)
     try:
         with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as res:
             charset = _detect_charset(res.headers.get("Content-Type", ""))
@@ -19,6 +19,17 @@ def fetch_html(url: str) -> tuple[int, str]:
         return e.code, ""
     except Exception:
         return 0, ""
+
+
+def _encode_url(url: str) -> str:
+    """URLに含まれる非ASCII文字（日本語等）をパーセントエンコードする"""
+    from urllib.parse import urlparse, urlunparse, quote, parse_qsl, urlencode
+    p = urlparse(url)
+    # パスの非ASCII文字をエンコード（/ は保持）
+    path = quote(p.path, safe="/:@!$&'()*+,;=")
+    # クエリパラメータを個別にエンコード（= & は保持）
+    query = urlencode([(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True)])
+    return urlunparse(p._replace(path=path, query=query))
 
 
 def _detect_charset(content_type: str) -> str:
