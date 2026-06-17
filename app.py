@@ -78,7 +78,7 @@ with st.sidebar:
     check_type = st.radio(
         "チェック種別",
         ["📄 タイトル取得", "🔗 リンクチェック", "⚡ Core Web Vitals",
-         "📝 表記ゆれ・禁止表現", "🕷️ バックグラウンドクロール"],
+         "📝 表記ゆれ・禁止表現", "🔍 アプリ・機能検出", "🕷️ バックグラウンドクロール"],
         index=0,
     )
 
@@ -121,10 +121,11 @@ with st.sidebar:
         bg_cfg["toyota_only"]  = st.checkbox("toyota.jpリンクのみ", value=True)
         _bg_checks = st.multiselect(
             "実行するチェック",
-            ["リンクチェック", "表記ゆれ・禁止表現", "Core Web Vitals"],
+            ["リンクチェック", "表記ゆれ・禁止表現", "Core Web Vitals", "アプリ・機能検出"],
             default=["リンクチェック"],
         )
-        _map = {"リンクチェック": "link", "表記ゆれ・禁止表現": "content", "Core Web Vitals": "cwv"}
+        _map = {"リンクチェック": "link", "表記ゆれ・禁止表現": "content",
+                "Core Web Vitals": "cwv", "アプリ・機能検出": "app"}
         bg_cfg["check_types"] = [_map[c] for c in _bg_checks]
         if "link" in bg_cfg["check_types"]:
             st.caption("リンクチェック: リソース種別")
@@ -382,6 +383,14 @@ if check_type == "🕷️ バックグラウンドクロール":
                             st.dataframe(df_w, use_container_width=True, height=300)
                             st.download_button("📥 CWV Excel", to_excel_bytes(df_w),
                                                f"cwv_{job_id_input}.xlsx", key="bg_dl_wx")
+                    if "app" in res:
+                        df_a = pd.DataFrame(res["app"]) if res["app"] else pd.DataFrame()
+                        app_cnt = len(df_a[df_a["アプリ性スコア"] > 0]) if not df_a.empty else 0
+                        st.subheader(f"🔍 アプリ・機能検出 (機能あり: {app_cnt} / {len(df_a)} ページ)")
+                        if not df_a.empty:
+                            st.dataframe(df_a, use_container_width=True, height=300)
+                            st.download_button("📥 アプリ検出 Excel", to_excel_bytes(df_a),
+                                               f"app_{job_id_input}.xlsx", key="bg_dl_ax")
     st.stop()
 
 # ─── 表記ゆれ辞書差分確認（常時表示） ────────────────────────────────
@@ -862,3 +871,97 @@ elif check_type == "📝 表記ゆれ・禁止表現":
         )
     else:
         st.success("問題のある表現は検出されませんでした ✅")
+
+# ════════════════════════════════════════
+# 🔍 アプリ・機能検出
+# ════════════════════════════════════════
+elif check_type == "🔍 アプリ・機能検出":
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from fetcher import extract_meta
+    from detector import summarize, CATEGORIES
+
+    rows = []
+    progress = st.progress(0, text="解析中...")
+
+    def _detect(url):
+        code, html = fetch_html(url)
+        if code != 200 or not html:
+            return {"URL": url, "タイトル": "", "アプリ性スコア": 0, "検出機能": f"❌ HTTP {code}",
+                    **{c: "" for c in CATEGORIES}}
+        meta = extract_meta(html)
+        return summarize(url, html, meta["short_title"])
+
+    with ThreadPoolExecutor(max_workers=CONCURRENT_WORKERS) as ex:
+        futs = {ex.submit(_detect, u): u for u in urls}
+        done = 0
+        for f in as_completed(futs):
+            rows.append(f.result())
+            done += 1
+            progress.progress(done / len(urls), text=f"解析中... {done}/{len(urls)}")
+            time.sleep(REQUEST_DELAY)
+
+    progress.empty()
+    df_app = pd.DataFrame(rows)
+
+    # ── サマリーメトリクス ────────────────────────────────────────────
+    n_with_feat = len(df_app[df_app["アプリ性スコア"] > 0])
+    n_high      = len(df_app[df_app["アプリ性スコア"] >= 3])
+    cat_counts  = {c: int((df_app[c] != "").sum()) for c in CATEGORIES}
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("解析ページ数", len(df_app))
+    c2.metric("機能検出あり", n_with_feat)
+    c3.metric("スコア3以上（高複雑度）", n_high)
+    c4.metric("最高スコア", int(df_app["アプリ性スコア"].max()) if len(df_app) else 0)
+
+    # ── カテゴリ別ヒット数 ─────────────────────────────────────────────
+    st.subheader("カテゴリ別検出ページ数")
+    df_cat = pd.DataFrame(
+        [{"カテゴリ": c, "検出ページ数": cat_counts[c]} for c in CATEGORIES if cat_counts[c] > 0]
+    ).sort_values("検出ページ数", ascending=False)
+    st.bar_chart(df_cat.set_index("カテゴリ")["検出ページ数"])
+
+    # ── フィルター付きページ一覧 ───────────────────────────────────────
+    st.subheader("ページ一覧（アプリ性スコア順）")
+    _cat_opts = ["すべて"] + [c for c in CATEGORIES if cat_counts.get(c, 0) > 0]
+    _cat_sel = st.selectbox("カテゴリでフィルタ", _cat_opts)
+    _score_min = st.slider("アプリ性スコア（最小）", 0, len(CATEGORIES), 1)
+
+    df_disp = df_app.copy()
+    if _cat_sel != "すべて":
+        df_disp = df_disp[df_disp[_cat_sel] != ""]
+    df_disp = df_disp[df_disp["アプリ性スコア"] >= _score_min]
+    df_disp = df_disp.sort_values("アプリ性スコア", ascending=False)
+
+    # 表示用: 全カラムを表示するとワイドになるので要約カラムを優先
+    _display_cols = ["URL", "タイトル", "アプリ性スコア", "検出機能"]
+    st.dataframe(df_disp[_display_cols], use_container_width=True, height=460)
+
+    # ── カテゴリ別ピボット（Excel向け） ────────────────────────────────
+    with st.expander("カテゴリ別詳細（ピボット表示）"):
+        _pivot_cols = ["URL", "タイトル", "アプリ性スコア"] + CATEGORIES
+        st.dataframe(
+            df_app.sort_values("アプリ性スコア", ascending=False)[_pivot_cols],
+            use_container_width=True,
+            height=400,
+        )
+
+    # ── ダウンロード ───────────────────────────────────────────────────
+    _all_cols = ["URL", "タイトル", "アプリ性スコア", "検出機能"] + CATEGORIES
+    df_dl = df_app.sort_values("アプリ性スコア", ascending=False)[_all_cols]
+    cx, cy = st.columns(2)
+    cx.download_button(
+        "📥 Excel（全件）",
+        to_excel_bytes(df_dl),
+        "app_detection.xlsx",
+        use_container_width=True,
+        key="dl_app_xlsx",
+    )
+    cy.download_button(
+        "📥 CSV（全件）",
+        df_dl.to_csv(index=False).encode("utf-8-sig"),
+        "app_detection.csv",
+        mime="text/csv",
+        use_container_width=True,
+        key="dl_app_csv",
+    )

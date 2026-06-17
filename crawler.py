@@ -305,6 +305,32 @@ def _run(job_id: str):
                 time.sleep(1.0)
             results["cwv"] = cwv
 
+        # ── Phase 5: アプリ・機能検出 ─────────────────────────────────
+        if "app" in check_types and n:
+            from detector import summarize
+
+            app_rows: list = []
+            done = 0
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                def _app(url):
+                    c, html = fetch_html(url)
+                    if c != 200 or not html:
+                        return {"URL": url, "タイトル": "", "アプリ性スコア": 0,
+                                "検出機能": f"❌ HTTP {c}"}
+                    meta = extract_meta(html)
+                    return summarize(url, html, meta["short_title"])
+                futs = {ex.submit(_app, u): u for u in urls}
+                for f in as_completed(futs):
+                    app_rows.append(f.result())
+                    done += 1
+                    _upd(job_id,
+                         phase=f"アプリ検出中 ({done}/{n})",
+                         progress=85 + round(done / n * 15))
+                    time.sleep(REQUEST_DELAY)
+            results["app"] = sorted(app_rows,
+                                    key=lambda r: r.get("アプリ性スコア", 0),
+                                    reverse=True)
+
         _upd(job_id,
              status="done",
              phase="完了",
