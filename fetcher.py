@@ -1,9 +1,10 @@
 """共通HTTPフェッチャー（ブラウザヘッダーでtoyota.jpの403を回避）"""
 
+import posixpath
 import re
-import time
 import urllib.request
 import urllib.error
+from urllib.parse import urljoin, urlparse, urlunparse
 from config import HEADERS, REQUEST_TIMEOUT
 
 
@@ -23,6 +24,30 @@ def fetch_html(url: str) -> tuple[int, str]:
 def _detect_charset(content_type: str) -> str:
     m = re.search(r"charset=([\w-]+)", content_type, re.I)
     return m.group(1) if m else "utf-8"
+
+
+def _resolve_base(html: str, page_url: str) -> str:
+    """相対URL解決に使うベースURLを返す。
+
+    優先順位:
+    1. HTML内の <base href="..."> タグ
+    2. 拡張子なし・末尾スラッシュなし → スラッシュを補完
+       例: /prius → /prius/ （urljoinが/priusをファイルと誤解するのを防ぐ）
+    """
+    # <base href> を最優先
+    m = re.search(r'<base[^>]+href=["\']([^"\']+)["\']', html, re.I)
+    if m:
+        return urljoin(page_url, m.group(1).strip())
+
+    # 拡張子なし・末尾スラッシュなし → ディレクトリとみなしてスラッシュ補完
+    parsed = urlparse(page_url)
+    path = parsed.path
+    if path and not path.endswith("/"):
+        _, ext = posixpath.splitext(path)
+        if not ext:
+            return urlunparse(parsed._replace(path=path + "/"))
+
+    return page_url
 
 
 def extract_meta(html: str) -> dict:
@@ -54,15 +79,15 @@ def extract_meta(html: str) -> dict:
 
 def extract_links(html: str, base_url: str) -> list[str]:
     """ページ内の<a href>リンクを絶対URLで返す"""
-    from urllib.parse import urljoin, urlparse
     import re as _re
 
-    hrefs = _re.findall(r'<a[^>]+href="([^"#][^"]*)"', html, _re.I)
+    base = _resolve_base(html, base_url)
+    hrefs = _re.findall(r'<a[^>]+href=["\']([^"\'#][^"\']*)["\']', html, _re.I)
     links = []
     for href in hrefs:
         if href.startswith(("mailto:", "tel:", "javascript:")):
             continue
-        abs_url = urljoin(base_url, href.split("#")[0])
+        abs_url = urljoin(base, href.split("#")[0])
         parsed = urlparse(abs_url)
         if parsed.scheme in ("http", "https"):
             links.append(abs_url)
@@ -71,37 +96,44 @@ def extract_links(html: str, base_url: str) -> list[str]:
 
 def extract_resources(html: str, base_url: str) -> list[tuple[str, str]]:
     """ページ内の全リソース（リンク・CSS・JS・画像・メディア）を (url, 種別) で返す"""
-    from urllib.parse import urljoin, urlparse
+    base = _resolve_base(html, base_url)
 
     SKIP = ("mailto:", "tel:", "javascript:", "data:")
     seen: set[str] = set()
     results: list[tuple[str, str]] = []
 
     def _add(href: str, rtype: str) -> None:
+        href = (href or "").strip()
         if not href or any(href.startswith(p) for p in SKIP):
             return
-        abs_url = urljoin(base_url, href.split("#")[0])
+        abs_url = urljoin(base, href.split("#")[0])
         if urlparse(abs_url).scheme not in ("http", "https"):
             return
         if abs_url not in seen:
             seen.add(abs_url)
             results.append((abs_url, rtype))
 
+    # href/src は二重引用符・単一引用符の両方に対応
     patterns = [
-        (r'<a[^>]+href="([^"]*)"',              "リンク"),
-        (r'<link[^>]+href="([^"]*)"',            "CSS/スタイル"),
-        (r'<script[^>]+src="([^"]*)"',           "JavaScript"),
-        (r'<img[^>]+src="([^"]*)"',              "画像"),
-        (r'<source[^>]+src="([^"]*)"',           "メディア"),
-        (r'<(?:video|audio)[^>]+src="([^"]*)"',  "メディア"),
-        (r'<iframe[^>]+src="([^"]*)"',           "iframe"),
+        (r'<a[^>]+href=["\']([^"\']*)["\']',              "リンク"),
+        (r'<link[^>]+href=["\']([^"\']*)["\']',           "CSS/スタイル"),
+        (r'<script[^>]+src=["\']([^"\']*)["\']',          "JavaScript"),
+        (r'<img[^>]+src=["\']([^"\']*)["\']',             "画像"),
+        (r'<source[^>]+src=["\']([^"\']*)["\']',          "メディア"),
+        (r'<(?:video|audio)[^>]+src=["\']([^"\']*)["\']', "メディア"),
+        (r'<iframe[^>]+src=["\']([^"\']*)["\']',          "iframe"),
     ]
     for pattern, rtype in patterns:
         for m in re.finditer(pattern, html, re.I):
             _add(m.group(1), rtype)
 
+    # <img srcset="url 2x, url2 3x"> の各URLを抽出
+    for m in re.finditer(r'srcset=["\']([^"\']+)["\']', html, re.I):
+        for part in m.group(1).split(","):
+            _add(part.strip().split()[0], "画像")
+
     # インラインstyle属性内のurl()
-    for m in re.finditer(r'style="[^"]*url\(["\']?([^"\')\s]+)["\']?\)', html, re.I):
+    for m in re.finditer(r'style=["\'][^"\']*url\(["\']?([^"\')\s]+)["\']?\)', html, re.I):
         _add(m.group(1), "画像(インラインCSS)")
 
     return results
