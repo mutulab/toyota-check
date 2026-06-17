@@ -87,9 +87,37 @@ with st.sidebar:
     if check_type == "🕷️ バックグラウンドクロール":
         st.divider()
         st.subheader("ジョブ設定")
-        bg_cfg["start_url"]    = st.text_input("開始URL", value="https://toyota.jp/")
-        bg_cfg["max_pages"]    = st.slider("最大収集ページ数", 10, 500, 100)
-        bg_cfg["depth"]        = int(st.number_input("クロール深さ", 1, 4, 2))
+
+        _bg_url_src = st.radio(
+            "URL取得方法",
+            ["🕷️ クロール（自動収集）", "📊 コンテンツ管理票（Excel）"],
+            key="bg_url_src",
+        )
+        if _bg_url_src.startswith("🕷"):
+            bg_cfg["url_source_type"] = "crawl"
+            bg_cfg["start_url"] = st.text_input("開始URL", value="https://toyota.jp/")
+            bg_cfg["max_pages"] = st.slider("最大収集ページ数", 10, 1000, 100)
+            bg_cfg["depth"]     = int(st.number_input("クロール深さ", 1, 4, 2))
+        else:
+            bg_cfg["url_source_type"] = "excel"
+            bg_cfg["start_url"] = ""
+            _bg_exc = st.file_uploader(
+                "コンテンツ管理票.xlsx", type=["xlsx"], key="bg_exc_ul"
+            )
+            if _bg_exc:
+                _fk = f"{_bg_exc.name}_{_bg_exc.size}"
+                if st.session_state.get("_bg_exc_key") != _fk:
+                    _exc_urls = load_urls_from_excel(_bg_exc)
+                    st.session_state["bg_excel_urls"] = _exc_urls
+                    st.session_state["_bg_exc_key"] = _fk
+            bg_cfg["urls"]      = st.session_state.get("bg_excel_urls", [])
+            bg_cfg["max_pages"] = len(bg_cfg["urls"])
+            bg_cfg["depth"]     = 0
+            if bg_cfg["urls"]:
+                st.caption(f"✅ {len(bg_cfg['urls'])} 件のURLを読み込みました")
+            else:
+                st.info("コンテンツ管理票をアップロードしてください")
+
         bg_cfg["toyota_only"]  = st.checkbox("toyota.jpリンクのみ", value=True)
         _bg_checks = st.multiselect(
             "実行するチェック",
@@ -166,7 +194,7 @@ with st.sidebar:
             limit = 0
         else:  # クロール（自動収集）
             crawl_start = st.text_input("開始URL", value="https://toyota.jp/")
-            crawl_max = st.slider("最大収集ページ数", 10, 500, 100,
+            crawl_max = st.slider("最大収集ページ数", 10, 1000, 100,
                                   help="まず50前後で試してください")
             crawl_depth = st.number_input("クロール深さ（階層数）", min_value=1, max_value=4, value=2,
                                           help="1=直リンクのみ / 2=その先も辿る")
@@ -198,12 +226,24 @@ with st.sidebar:
 
         if check_type == "📝 表記ゆれ・禁止表現":
             st.divider()
-            st.subheader("カスタム辞書")
+            st.subheader("表記ゆれ辞書")
+            from dict_loader import load_flat, source_label as _src_label
+            _cur_flat = load_flat()
+            st.caption(f"{_src_label()} · {len(_cur_flat)} 件")
+            with st.expander("辞書を更新（Excelアップロード）"):
+                _dict_xl = st.file_uploader(
+                    "toyota_lexus用語リスト.xlsx", type=["xlsx"], key="dict_xl_up"
+                )
+                if _dict_xl:
+                    _dk = f"{_dict_xl.name}_{_dict_xl.size}"
+                    if st.session_state.get("_dict_xl_key") != _dk:
+                        st.session_state["_dict_new_bytes"] = _dict_xl.read()
+                        st.session_state["_dict_xl_key"] = _dk
             custom_dict_raw = st.text_area(
-                "追加する表記ゆれ（1行1件: 誤表記|推奨表記）",
-                height=130,
+                "追加エントリ（1行1件: NG表記|推奨表記）",
+                height=100,
                 placeholder="ウエブサイト|WEBサイト\nお問合せ|お問い合わせ",
-                help="デフォルト辞書に加えて独自チェック項目を追加。正規表現も使用可。",
+                help="辞書にない追加チェック項目。正規表現も使用可。",
             )
         else:
             custom_dict_raw = ""
@@ -235,13 +275,16 @@ if check_type == "🕷️ バックグラウンドクロール":
         st.subheader("ジョブ設定")
         st.json({k: v for k, v in bg_cfg.items() if k != "psi_key"})
         if run_btn:  # サイドバーの「▶ チェック実行」= ジョブ開始
-            try:
-                jid = _cw.start_job(bg_cfg)
-                st.session_state["bg_job_id"] = jid
-                st.success(f"ジョブを開始しました。**ジョブID: `{jid}`**")
-                st.info("ブラウザを閉じても処理は継続します。「🔍 ジョブ確認」タブで結果を確認してください。")
-            except Exception as _e:
-                st.error(f"ジョブ開始に失敗しました: {_e}")
+            if bg_cfg.get("url_source_type") == "excel" and not bg_cfg.get("urls"):
+                st.error("コンテンツ管理票のExcelをアップロードしてください。")
+            else:
+                try:
+                    jid = _cw.start_job(bg_cfg)
+                    st.session_state["bg_job_id"] = jid
+                    st.success(f"ジョブを開始しました。**ジョブID: `{jid}`**")
+                    st.info("ブラウザを閉じても処理は継続します。「🔍 ジョブ確認」タブで結果を確認してください。")
+                except Exception as _e:
+                    st.error(f"ジョブ開始に失敗しました: {_e}")
         else:
             st.info("設定を確認して、サイドバーの「▶ チェック実行」を押すとジョブが開始されます。")
 
@@ -252,10 +295,10 @@ if check_type == "🕷️ バックグラウンドクロール":
 
         if recent:
             _NONE = "— IDを直接入力 —"
-            _opts: dict = {
-                f"{j['id']}  [{j['status']}]  {j['cfg']['start_url']}  ({j['started_at'][:16]})": j["id"]
-                for j in recent
-            }
+            def _jlabel(j):
+                src = j["cfg"].get("start_url") or f"Excel ({j['cfg'].get('max_pages', '?')}件)"
+                return f"{j['id']}  [{j['status']}]  {src}  ({j['started_at'][:16]})"
+            _opts: dict = {_jlabel(j): j["id"] for j in recent}
             _all_keys = [_NONE] + list(_opts.keys())
             _sess_id = st.session_state.get("bg_job_id", "")
             _def_key = next((k for k, v in _opts.items() if v == _sess_id), _NONE)
@@ -291,6 +334,17 @@ if check_type == "🕷️ バックグラウンドクロール":
                     st.error(f"エラー: {job.get('error', '')}")
 
                 if job["status"] == "running":
+                    from datetime import datetime as _dt
+                    _last = job.get("last_updated_at") or job.get("started_at", "")
+                    try:
+                        _elapsed = (_dt.now() - _dt.fromisoformat(_last)).total_seconds()
+                        if _elapsed > 600:
+                            st.warning(
+                                f"⚠️ 最終更新から {int(_elapsed / 60)} 分経過しています。"
+                                "タスクがスタックしている可能性があります。"
+                            )
+                    except Exception:
+                        pass
                     st.info("実行中です。完了したら「🔄 更新」を押してください。")
                     if st.button("🔄 更新"):
                         st.rerun()
@@ -329,6 +383,59 @@ if check_type == "🕷️ バックグラウンドクロール":
                             st.download_button("📥 CWV Excel", to_excel_bytes(df_w),
                                                f"cwv_{job_id_input}.xlsx", key="bg_dl_wx")
     st.stop()
+
+# ─── 表記ゆれ辞書差分確認（常時表示） ────────────────────────────────
+if check_type == "📝 表記ゆれ・禁止表現" and "_dict_new_bytes" in st.session_state:
+    import io as _io
+    from dict_loader import load_flat, read_excel_flat, save_override
+    try:
+        _new_flat = read_excel_flat(_io.BytesIO(st.session_state["_dict_new_bytes"]))
+        _cur_flat = load_flat()
+        _added   = {k: v for k, v in _new_flat.items() if k not in _cur_flat}
+        _removed = {k: v for k, v in _cur_flat.items() if k not in _new_flat}
+        _changed = {k: (_cur_flat[k], v) for k, v in _new_flat.items()
+                    if k in _cur_flat and _cur_flat[k] != v}
+        total_delta = len(_added) + len(_removed) + len(_changed)
+        if total_delta:
+            st.subheader(f"📋 辞書差分プレビュー（+{len(_added)} / -{len(_removed)} / ~{len(_changed)}）")
+            if _added:
+                with st.expander(f"✅ 追加: {len(_added)} 件"):
+                    st.dataframe(
+                        pd.DataFrame([{"NG表記": k, "推奨表記": v} for k, v in _added.items()]),
+                        use_container_width=True,
+                    )
+            if _removed:
+                with st.expander(f"❌ 削除: {len(_removed)} 件"):
+                    st.dataframe(
+                        pd.DataFrame([{"NG表記": k, "推奨表記": v} for k, v in _removed.items()]),
+                        use_container_width=True,
+                    )
+            if _changed:
+                with st.expander(f"✏️ 変更: {len(_changed)} 件"):
+                    st.dataframe(
+                        pd.DataFrame([{"NG表記": k, "旧推奨": old, "新推奨": new}
+                                      for k, (old, new) in _changed.items()]),
+                        use_container_width=True,
+                    )
+            _ca, _cb = st.columns(2)
+            if _ca.button("✅ 差分を適用", type="primary", key="apply_dict"):
+                save_override(st.session_state["_dict_new_bytes"])
+                for _k in ("_dict_new_bytes", "_dict_xl_key"):
+                    st.session_state.pop(_k, None)
+                st.success("辞書を更新しました。")
+                st.rerun()
+            if _cb.button("❌ キャンセル", key="cancel_dict"):
+                for _k in ("_dict_new_bytes", "_dict_xl_key"):
+                    st.session_state.pop(_k, None)
+                st.rerun()
+        else:
+            st.info("アップロードした辞書と現在の辞書に差分はありません。")
+            for _k in ("_dict_new_bytes", "_dict_xl_key"):
+                st.session_state.pop(_k, None)
+    except Exception as _dict_err:
+        st.error(f"辞書の読み込みに失敗しました: {_dict_err}")
+        for _k in ("_dict_new_bytes", "_dict_xl_key"):
+            st.session_state.pop(_k, None)
 
 # ─── 通常モード: ボタンを押すまで待機 ──────────────────────────────
 if not run_btn:
@@ -640,10 +747,11 @@ elif check_type == "📝 表記ゆれ・禁止表現":
     import re
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from fetcher import extract_meta, extract_text_blocks
-    from config import HYOKI_YURE, KINSHI_PATTERNS
+    from config import KINSHI_PATTERNS
+    from dict_loader import load_for_check
 
-    # デフォルト辞書 + カスタム辞書をマージ
-    merged_dict = dict(HYOKI_YURE)
+    # Excel辞書 + カスタム追加エントリをマージ
+    merged_dict = load_for_check()
     for line in custom_dict_raw.splitlines():
         line = line.strip()
         if "|" in line:

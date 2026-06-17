@@ -29,6 +29,7 @@ def start_job(cfg: dict) -> str:
         "cfg": cfg,
         "started_at": datetime.now().isoformat(),
         "finished_at": None,
+        "last_updated_at": datetime.now().isoformat(),
         "url_count": 0,
         "urls": [],
         "results": {},
@@ -81,6 +82,7 @@ def _save(job_id: str):
 
 def _upd(job_id: str, **kw):
     _JOBS[job_id].update(kw)
+    _JOBS[job_id]["last_updated_at"] = datetime.now().isoformat()
     _save(job_id)
 
 
@@ -92,14 +94,14 @@ def _run(job_id: str):
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from fetcher import (fetch_html, extract_links, extract_resources,
                          extract_css_urls, extract_meta, extract_text_blocks)
-    from config import (REQUEST_DELAY, THRESHOLDS, PSI_ENDPOINT,
-                        HYOKI_YURE, KINSHI_PATTERNS)
+    from config import (REQUEST_DELAY, THRESHOLDS, PSI_ENDPOINT, KINSHI_PATTERNS)
+    from dict_loader import load_for_check
 
     job = _JOBS[job_id]
     cfg = job["cfg"]
 
     try:
-        start_url   = cfg["start_url"]
+        start_url   = cfg.get("start_url", "")
         max_pages   = cfg["max_pages"]
         max_depth   = cfg["depth"]
         check_types = set(cfg.get("check_types", []))
@@ -109,33 +111,47 @@ def _run(job_id: str):
         strategy    = cfg.get("strategy", "mobile")
         custom_raw  = cfg.get("custom_dict", "")
         base_domain = urlparse(start_url).netloc
+        # Excel mode: derive base_domain from first supplied URL
+        if not base_domain and cfg.get("url_source_type") == "excel":
+            _first = (cfg.get("urls") or [""])[0]
+            base_domain = urlparse(_first).netloc
 
-        # ── Phase 1: クロール ─────────────────────────────────────────────
-        _upd(job_id, phase="クロール中", progress=0)
-        visited: set = set()
-        queue: deque = deque([(start_url.rstrip("/"), 0)])
-        urls: list = []
+        # ── Phase 1: URL取得（クロール or Excel指定） ─────────────────────
+        url_source_type = cfg.get("url_source_type", "crawl")
 
-        while queue and len(urls) < max_pages:
-            url, depth = queue.popleft()
-            norm = url.rstrip("/").split("?")[0].split("#")[0]
-            if norm in visited:
-                continue
-            visited.add(norm)
-            code, html = fetch_html(url)
-            if code == 200 and html:
-                urls.append(url)
-                _upd(job_id,
-                     urls=urls[:],
-                     url_count=len(urls),
-                     progress=round(len(urls) / max_pages * 30))
-                if depth < max_depth:
-                    for link in extract_links(html, url):
-                        if urlparse(link).netloc == base_domain:
-                            c = link.rstrip("/").split("?")[0].split("#")[0]
-                            if c not in visited:
-                                queue.append((link, depth + 1))
-            time.sleep(REQUEST_DELAY)
+        if url_source_type == "excel":
+            urls = list(cfg.get("urls", []))[:max_pages]
+            _upd(job_id,
+                 phase="URL読み込み完了（コンテンツ管理票）",
+                 progress=30,
+                 urls=urls[:],
+                 url_count=len(urls))
+        else:
+            _upd(job_id, phase="クロール中", progress=0)
+            visited: set = set()
+            queue: deque = deque([(start_url.rstrip("/"), 0)])
+            urls: list = []
+
+            while queue and len(urls) < max_pages:
+                url, depth = queue.popleft()
+                norm = url.rstrip("/").split("?")[0].split("#")[0]
+                if norm in visited:
+                    continue
+                visited.add(norm)
+                code, html = fetch_html(url)
+                if code == 200 and html:
+                    urls.append(url)
+                    _upd(job_id,
+                         urls=urls[:],
+                         url_count=len(urls),
+                         progress=round(len(urls) / max_pages * 30))
+                    if depth < max_depth:
+                        for link in extract_links(html, url):
+                            if urlparse(link).netloc == base_domain:
+                                c = link.rstrip("/").split("?")[0].split("#")[0]
+                                if c not in visited:
+                                    queue.append((link, depth + 1))
+                time.sleep(REQUEST_DELAY)
 
         n = len(urls)
         results: dict = {}
@@ -202,7 +218,7 @@ def _run(job_id: str):
 
         # ── Phase 3: 表記ゆれ ─────────────────────────────────────────────
         if "content" in check_types and n:
-            merged = dict(HYOKI_YURE)
+            merged = load_for_check()
             for line in custom_raw.splitlines():
                 if "|" in line:
                     w, c = line.split("|", 1)
