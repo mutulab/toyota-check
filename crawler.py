@@ -211,9 +211,12 @@ def _run(job_id: str):
             for src in sorted(page_res):
                 for ru, rt in page_res[src]:
                     c = ls.get(ru, 0)
-                    if c in (404, 410) or c == 0:
+                    if c in (404, 410):
                         broken.append({"発見ページ": src, "リソースURL": ru,
-                                       "種別": rt, "ステータス": c})
+                                       "種別": rt, "ステータス": c, "判定": "❌ 切れ"})
+                    elif c == 0:
+                        broken.append({"発見ページ": src, "リソースURL": ru,
+                                       "種別": rt, "ステータス": c, "判定": "⚠️ 確認不可"})
             results["link"] = broken
 
         # ── Phase 3: 表記ゆれ ─────────────────────────────────────────────

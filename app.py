@@ -354,9 +354,19 @@ if check_type == "🕷️ バックグラウンドクロール":
                     res = job.get("results", {})
                     if "link" in res:
                         df_l = pd.DataFrame(res["link"]) if res["link"] else pd.DataFrame()
-                        st.subheader(f"🔗 リンク切れ ({len(df_l)} 件)")
+                        _broken_cnt = int((df_l["判定"] == "❌ 切れ").sum()) if not df_l.empty and "判定" in df_l.columns else len(df_l)
+                        _unv_cnt    = int((df_l["判定"] == "⚠️ 確認不可").sum()) if not df_l.empty and "判定" in df_l.columns else 0
+                        st.subheader(f"🔗 リンク切れ {_broken_cnt} 件 / 確認不可 {_unv_cnt} 件")
                         if not df_l.empty:
-                            st.dataframe(df_l, use_container_width=True, height=300)
+                            _df_broken_bg = df_l[df_l["判定"] == "❌ 切れ"] if "判定" in df_l.columns else df_l
+                            _df_unv_bg    = df_l[df_l["判定"] == "⚠️ 確認不可"] if "判定" in df_l.columns else pd.DataFrame()
+                            if not _df_broken_bg.empty:
+                                st.write("**❌ リンク切れ（404/410）**")
+                                st.dataframe(_df_broken_bg, use_container_width=True, height=250)
+                            if not _df_unv_bg.empty:
+                                with st.expander(f"⚠️ 確認不可 {len(_df_unv_bg)} 件"):
+                                    st.caption("接続失敗（status=0）。実際にはリンク切れでない場合があります。")
+                                    st.dataframe(_df_unv_bg, use_container_width=True, height=200)
                             c1, c2 = st.columns(2)
                             c1.download_button("📥 Excel", to_excel_bytes(df_l),
                                                f"links_{job_id_input}.xlsx", key="bg_dl_lx")
@@ -628,36 +638,44 @@ elif check_type == "🔗 リンクチェック":
     progress2.empty()
 
     # Phase 3: 発見ページ × リソースURL で集計
-    broken_rows = []
+    broken_rows = []      # 404 / 410 — 確実なリンク切れ
+    unverif_rows = []     # status=0  — 接続失敗（切れているとは断言できない）
     all_rows = []
     for src in sorted(page_resources):
         d = page_resources[src]
         for res_url, res_type in d["resources"]:
             code = resource_status.get(res_url, 0)
-            broken = code in (404, 410) or code == 0
+            if code in (404, 410):
+                judgment = "❌ 切れ"
+            elif code == 0:
+                judgment = "⚠️ 確認不可"
+            else:
+                judgment = "✅ 正常"
             row = {
                 "発見ページ": src,
                 "リソースURL": res_url,
                 "種別": res_type,
                 "ドメイン": urlparse(res_url).netloc,
                 "ステータス": code,
-                "判定": "❌ 切れ" if broken else "✅ 正常",
+                "判定": judgment,
             }
             all_rows.append(row)
-            if broken:
+            if judgment == "❌ 切れ":
                 broken_rows.append(row)
+            elif judgment == "⚠️ 確認不可":
+                unverif_rows.append(row)
 
     broken_pages = len({r["発見ページ"] for r in broken_rows})
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     col1.metric("対象ページ数", len(urls))
-    col2.metric("❌ 問題ページ数", broken_pages)
-    col3.metric("❌ 問題リソース件数", len(broken_rows))
+    col2.metric("❌ リンク切れ件数", len(broken_rows))
+    col3.metric("❌ リンク切れページ", broken_pages)
+    col4.metric("⚠️ 確認不可", len(unverif_rows))
 
     if broken_rows:
-        st.error(f"問題リソース: {len(broken_rows)} 件（{broken_pages} ページで発見）")
-        st.subheader("❌ 問題リソース一覧")
+        st.error(f"リンク切れ: {len(broken_rows)} 件（{broken_pages} ページで発見）")
+        st.subheader("❌ リンク切れ一覧（404 / 410）")
         df_broken = pd.DataFrame(broken_rows)
-        # 種別フィルタ
         types = ["すべて"] + sorted(df_broken["種別"].unique().tolist())
         sel = st.selectbox("種別フィルタ", types)
         disp = df_broken if sel == "すべて" else df_broken[df_broken["種別"] == sel]
@@ -669,7 +687,24 @@ elif check_type == "🔗 リンクチェック":
                            "links_broken.csv", mime="text/csv",
                            use_container_width=True, key="dl_broken_csv")
     else:
-        st.success("問題のあるリソースは検出されませんでした ✅")
+        st.success("リンク切れは検出されませんでした ✅")
+
+    if unverif_rows:
+        with st.expander(f"⚠️ 確認不可 {len(unverif_rows)} 件（接続できなかったリソース）"):
+            st.caption(
+                "チェックサーバーから到達できなかったリソースです（status=0）。"
+                "アクセス制限・レートリミット・ネットワーク経路の問題が原因の場合が多く、"
+                "実際にはリンク切れでないケースがあります。ブラウザで個別に確認してください。"
+            )
+            df_unv = pd.DataFrame(unverif_rows)
+            st.dataframe(df_unv, use_container_width=True, height=300)
+            c1u, c2u = st.columns(2)
+            c1u.download_button("📥 Excel", to_excel_bytes(df_unv),
+                                "links_unverifiable.xlsx", use_container_width=True,
+                                key="dl_unv_xlsx")
+            c2u.download_button("📥 CSV", df_unv.to_csv(index=False).encode("utf-8-sig"),
+                                "links_unverifiable.csv", mime="text/csv",
+                                use_container_width=True, key="dl_unv_csv")
 
     with st.expander(f"全リソース一覧（{len(all_rows)} 件）"):
         df_all = pd.DataFrame(all_rows)
