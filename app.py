@@ -229,8 +229,32 @@ with st.sidebar:
             st.divider()
             st.subheader("表記ゆれ辞書")
             from dict_loader import load_flat, source_label as _src_label
-            _cur_flat = load_flat()
+            from pathlib import Path as _Path
+            _TMP_D     = _Path("/tmp/toyota-check-hyoki.xlsx")
+            _BUNDLED_D = _Path(__file__).parent / "hyoki_dict.xlsx"
+            _cur_flat  = load_flat()
+            _using_tmp = _TMP_D.exists()
             st.caption(f"{_src_label()} · {len(_cur_flat)} 件")
+
+            # 現在の辞書をダウンロード
+            _dl_path = _TMP_D if _using_tmp else (_BUNDLED_D if _BUNDLED_D.exists() else None)
+            if _dl_path:
+                st.download_button(
+                    "📥 現在の辞書をダウンロード",
+                    _dl_path.read_bytes(),
+                    file_name="hyoki_dict.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                    key="dl_cur_dict",
+                )
+            if _using_tmp:
+                st.warning(
+                    "セッション辞書を使用中です。\n\n"
+                    "アプリ再起動で消えるため、永続化するには↑でダウンロードして"
+                    " `hyoki_dict.xlsx` としてリポジトリに commit してください。",
+                    icon="⚠️",
+                )
+
             with st.expander("辞書を更新（Excelアップロード）"):
                 _dict_xl = st.file_uploader(
                     "toyota_lexus用語リスト.xlsx", type=["xlsx"], key="dict_xl_up"
@@ -439,9 +463,10 @@ if check_type == "📝 表記ゆれ・禁止表現" and "_dict_new_bytes" in st.
             _ca, _cb = st.columns(2)
             if _ca.button("✅ 差分を適用", type="primary", key="apply_dict"):
                 save_override(st.session_state["_dict_new_bytes"])
+                st.session_state["_dict_applied_bytes"] = st.session_state["_dict_new_bytes"]
                 for _k in ("_dict_new_bytes", "_dict_xl_key"):
                     st.session_state.pop(_k, None)
-                st.success("辞書を更新しました。")
+                st.success("辞書をセッションに適用しました。")
                 st.rerun()
             if _cb.button("❌ キャンセル", key="cancel_dict"):
                 for _k in ("_dict_new_bytes", "_dict_xl_key"):
@@ -455,6 +480,28 @@ if check_type == "📝 表記ゆれ・禁止表現" and "_dict_new_bytes" in st.
         st.error(f"辞書の読み込みに失敗しました: {_dict_err}")
         for _k in ("_dict_new_bytes", "_dict_xl_key"):
             st.session_state.pop(_k, None)
+
+# 差分適用直後: ダウンロード＆永続化案内を表示
+if (check_type == "📝 表記ゆれ・禁止表現"
+        and "_dict_applied_bytes" in st.session_state):
+    st.success("✅ 辞書をセッションに適用しました。")
+    st.info(
+        "**永続化するには** 👇 からダウンロードして、"
+        " `hyoki_dict.xlsx` としてリポジトリに commit してください。"
+        "次回デプロイ以降、アップロード不要でこの辞書が使われます。"
+    )
+    st.download_button(
+        "📥 適用済み辞書をダウンロード（hyoki_dict.xlsx）",
+        st.session_state["_dict_applied_bytes"],
+        file_name="hyoki_dict.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        key="dl_applied_dict",
+        type="primary",
+    )
+    if st.button("閉じる", key="close_applied_banner"):
+        st.session_state.pop("_dict_applied_bytes", None)
+        st.rerun()
 
 # ─── 通常モード: ボタンを押すまで待機 ──────────────────────────────
 if not run_btn:
