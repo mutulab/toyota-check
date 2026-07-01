@@ -77,8 +77,9 @@ with st.sidebar:
 
     check_type = st.radio(
         "チェック種別",
-        ["📄 タイトル取得", "🔗 リンクチェック", "⚡ Core Web Vitals",
-         "📝 表記ゆれ・禁止表現", "🔍 アプリ・機能検出", "🕷️ バックグラウンドクロール"],
+        ["📄 タイトル取得", "🔗 リンクチェック", "🌐 外部リンクチェック",
+         "⚡ Core Web Vitals", "📝 表記ゆれ・禁止表現", "🔍 アプリ・機能検出",
+         "🕷️ バックグラウンドクロール"],
         index=0,
     )
 
@@ -121,10 +122,12 @@ with st.sidebar:
         bg_cfg["toyota_only"]  = st.checkbox("toyota.jpリンクのみ", value=True)
         _bg_checks = st.multiselect(
             "実行するチェック",
-            ["リンクチェック", "表記ゆれ・禁止表現", "Core Web Vitals", "アプリ・機能検出"],
+            ["リンクチェック", "外部リンクチェック", "表記ゆれ・禁止表現",
+             "Core Web Vitals", "アプリ・機能検出"],
             default=["リンクチェック"],
         )
-        _map = {"リンクチェック": "link", "表記ゆれ・禁止表現": "content",
+        _map = {"リンクチェック": "link", "外部リンクチェック": "extlink",
+                "表記ゆれ・禁止表現": "content",
                 "Core Web Vitals": "cwv", "アプリ・機能検出": "app"}
         bg_cfg["check_types"] = [_map[c] for c in _bg_checks]
         if "link" in bg_cfg["check_types"]:
@@ -398,6 +401,25 @@ if check_type == "🕷️ バックグラウンドクロール":
                                                df_l.to_csv(index=False).encode("utf-8-sig"),
                                                f"links_{job_id_input}.csv", mime="text/csv",
                                                key="bg_dl_lc")
+                    if "extlink" in res:
+                        df_ex = pd.DataFrame(res["extlink"]) if res["extlink"] else pd.DataFrame()
+                        _ex_broken = int((df_ex["判定"] == "❌ 切れ").sum()) if not df_ex.empty and "判定" in df_ex.columns else 0
+                        _ex_unv    = int((df_ex["判定"] == "⚠️ 確認不可").sum()) if not df_ex.empty and "判定" in df_ex.columns else 0
+                        st.subheader(f"🌐 外部リンク {len(df_ex)} 件 / 切れ {_ex_broken} 件 / 確認不可 {_ex_unv} 件")
+                        if not df_ex.empty:
+                            _df_ex_broken = df_ex[df_ex["判定"] == "❌ 切れ"] if "判定" in df_ex.columns else df_ex
+                            _df_ex_unv    = df_ex[df_ex["判定"] == "⚠️ 確認不可"] if "判定" in df_ex.columns else pd.DataFrame()
+                            if not _df_ex_broken.empty:
+                                st.write("**❌ 外部リンク切れ（404/410）**")
+                                st.dataframe(_df_ex_broken, use_container_width=True, height=200)
+                            if not _df_ex_unv.empty:
+                                with st.expander(f"⚠️ 確認不可 {len(_df_ex_unv)} 件"):
+                                    st.dataframe(_df_ex_unv, use_container_width=True, height=200)
+                            with st.expander(f"全外部リンク一覧 ({len(df_ex)} 件)"):
+                                st.dataframe(df_ex, use_container_width=True, height=300)
+                            st.download_button("📥 外部リンク Excel", to_excel_bytes(df_ex),
+                                               f"extlinks_{job_id_input}.xlsx", key="bg_dl_ex")
+
                     if "content" in res:
                         df_c = pd.DataFrame(res["content"]) if res["content"] else pd.DataFrame()
                         st.subheader(f"📝 表記ゆれ・禁止表現 ({len(df_c)} 件)")
@@ -762,6 +784,146 @@ elif check_type == "🔗 リンクチェック":
         cb.download_button("📥 全件CSV", df_all.to_csv(index=False).encode("utf-8-sig"),
                            "links_all.csv", mime="text/csv",
                            use_container_width=True, key="dl_all_csv")
+
+# ════════════════════════════════════════
+# 🌐 外部リンクチェック
+# ════════════════════════════════════════
+elif check_type == "🌐 外部リンクチェック":
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from fetcher import extract_links as _ext_extract_links
+    from urllib.parse import urlparse as _ext_urlparse
+
+    base_domain = _ext_urlparse(urls[0]).netloc if urls else "toyota.jp"
+
+    # Phase 1: 各ページから外部リンクを収集
+    st.caption("Phase 1/2 — ページ内の外部リンクを収集中")
+    progress1 = st.progress(0, text="収集中...")
+    page_ext_links: dict = {}
+
+    def _collect_ext(url):
+        code, html = fetch_html(url)
+        if code != 200 or not html:
+            return url, []
+        all_links = _ext_extract_links(html, url)
+        return url, [lk for lk in all_links
+                     if _ext_urlparse(lk).netloc not in (base_domain, "")]
+
+    with ThreadPoolExecutor(max_workers=CONCURRENT_WORKERS) as ex:
+        futs = {ex.submit(_collect_ext, u): u for u in urls}
+        done = 0
+        for f in as_completed(futs):
+            pg, links = f.result()
+            page_ext_links[pg] = links
+            done += 1
+            progress1.progress(done / len(urls), text=f"収集中... {done}/{len(urls)}")
+            time.sleep(REQUEST_DELAY)
+    progress1.empty()
+
+    all_ext_urls = list({lk for links in page_ext_links.values() for lk in links})
+
+    if not all_ext_urls:
+        st.info("外部リンクは検出されませんでした。")
+        st.stop()
+
+    st.caption(f"Phase 2/2 — 外部リンク {len(all_ext_urls)} 件のステータスを確認中")
+    progress2 = st.progress(0, text="確認中...")
+    ext_status: dict = {}
+
+    def _ping_ext(url):
+        code, _ = fetch_html(url)
+        return url, code
+
+    with ThreadPoolExecutor(max_workers=CONCURRENT_WORKERS) as ex:
+        futs = {ex.submit(_ping_ext, u): u for u in all_ext_urls}
+        done = 0
+        for f in as_completed(futs):
+            url, code = f.result()
+            ext_status[url] = code
+            done += 1
+            progress2.progress(done / len(all_ext_urls), text=f"確認中... {done}/{len(all_ext_urls)}")
+            time.sleep(REQUEST_DELAY)
+    progress2.empty()
+
+    # Phase 3: 集計
+    ext_broken, ext_restricted, ext_unverif, ext_all = [], [], [], []
+    for src in sorted(page_ext_links):
+        for ext_url in page_ext_links[src]:
+            code = ext_status.get(ext_url, 0)
+            domain = _ext_urlparse(ext_url).netloc
+            if code in (404, 410):
+                judgment = "❌ 切れ"
+            elif code == 403:
+                judgment = "🔒 アクセス制限"
+            elif code == 0:
+                judgment = "⚠️ 確認不可"
+            else:
+                judgment = "✅ 正常"
+            row = {
+                "発見ページ": src, "外部リンクURL": ext_url,
+                "ドメイン": domain, "ステータス": code, "判定": judgment,
+            }
+            ext_all.append(row)
+            if judgment == "❌ 切れ":
+                ext_broken.append(row)
+            elif judgment == "🔒 アクセス制限":
+                ext_restricted.append(row)
+            elif judgment == "⚠️ 確認不可":
+                ext_unverif.append(row)
+
+    domain_counts = {}
+    for r in ext_all:
+        d = r["ドメイン"]
+        domain_counts[d] = domain_counts.get(d, 0) + 1
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("外部リンク総数", len(ext_all))
+    c2.metric("❌ 切れ", len(ext_broken))
+    c3.metric("🔒 アクセス制限", len(ext_restricted))
+    c4.metric("⚠️ 確認不可", len(ext_unverif))
+
+    if ext_broken:
+        st.error(f"外部リンク切れ: {len(ext_broken)} 件")
+        st.subheader("❌ 切れた外部リンク（404 / 410）")
+        st.dataframe(pd.DataFrame(ext_broken), use_container_width=True, height=300)
+        c1x, c2x = st.columns(2)
+        c1x.download_button("📥 Excel", to_excel_bytes(pd.DataFrame(ext_broken)),
+                            "ext_broken.xlsx", use_container_width=True, key="dl_extb_x")
+        c2x.download_button("📥 CSV", pd.DataFrame(ext_broken).to_csv(index=False).encode("utf-8-sig"),
+                            "ext_broken.csv", mime="text/csv",
+                            use_container_width=True, key="dl_extb_c")
+    else:
+        st.success("外部リンク切れは検出されませんでした ✅")
+
+    if ext_restricted:
+        with st.expander(f"🔒 アクセス制限 {len(ext_restricted)} 件（403）"):
+            st.caption("チェックサーバーからのアクセスが拒否されましたが、ブラウザでは閲覧できる場合があります。")
+            st.dataframe(pd.DataFrame(ext_restricted), use_container_width=True, height=200)
+
+    if ext_unverif:
+        with st.expander(f"⚠️ 確認不可 {len(ext_unverif)} 件（接続失敗）"):
+            st.caption("タイムアウト・接続拒否等。実際には正常なリンクの可能性があります。")
+            st.dataframe(pd.DataFrame(ext_unverif), use_container_width=True, height=200)
+
+    st.subheader("ドメイン別集計")
+    df_dom = pd.DataFrame(
+        [{"ドメイン": d, "リンク数": cnt} for d, cnt in
+         sorted(domain_counts.items(), key=lambda x: -x[1])]
+    )
+    st.dataframe(df_dom, use_container_width=True, height=300)
+
+    with st.expander(f"全外部リンク一覧 ({len(ext_all)} 件)"):
+        df_ext_all = pd.DataFrame(ext_all)
+        _sel_d = st.selectbox("ドメインフィルタ",
+                              ["すべて"] + sorted(domain_counts.keys()),
+                              key="ext_dom_filter")
+        disp_ext = df_ext_all if _sel_d == "すべて" else df_ext_all[df_ext_all["ドメイン"] == _sel_d]
+        st.dataframe(disp_ext, use_container_width=True, height=350)
+        ca, cb = st.columns(2)
+        ca.download_button("📥 全件Excel", to_excel_bytes(df_ext_all),
+                           "extlinks_all.xlsx", use_container_width=True, key="dl_extall_x")
+        cb.download_button("📥 全件CSV", df_ext_all.to_csv(index=False).encode("utf-8-sig"),
+                           "extlinks_all.csv", mime="text/csv",
+                           use_container_width=True, key="dl_extall_c")
 
 # ════════════════════════════════════════
 # ⚡ Core Web Vitals

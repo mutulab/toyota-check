@@ -44,21 +44,28 @@ def _resolve_base(html: str, page_url: str) -> str:
     1. HTML内の <base href="..."> タグ
     2. 拡張子なし・末尾スラッシュなし → スラッシュを補完
        例: /prius → /prius/ （urljoinが/priusをファイルと誤解するのを防ぐ）
+
+    <base href> の値自体も同じルールでスラッシュ補完する。
+    バージョン番号形式 "4.0" は posixpath.splitext が ".0" を拡張子と誤判定するため、
+    "数字のみ拡張子" もディレクトリ扱いとする。
     """
+    def _add_slash_if_dir(url: str) -> str:
+        p = urlparse(url)
+        path = p.path
+        if not path or path.endswith("/"):
+            return url
+        _, ext = posixpath.splitext(path)
+        # 拡張子なし or ".数字" のみ（バージョン番号: 4.0, 3.1 等）はディレクトリ扱い
+        if not ext or re.fullmatch(r'\.\d+', ext):
+            return urlunparse(p._replace(path=path + "/"))
+        return url
+
     # <base href> を最優先
     m = re.search(r'<base[^>]+href=["\']([^"\']+)["\']', html, re.I)
     if m:
-        return urljoin(page_url, m.group(1).strip())
+        return _add_slash_if_dir(urljoin(page_url, m.group(1).strip()))
 
-    # 拡張子なし・末尾スラッシュなし → ディレクトリとみなしてスラッシュ補完
-    parsed = urlparse(page_url)
-    path = parsed.path
-    if path and not path.endswith("/"):
-        _, ext = posixpath.splitext(path)
-        if not ext:
-            return urlunparse(parsed._replace(path=path + "/"))
-
-    return page_url
+    return _add_slash_if_dir(page_url)
 
 
 def extract_meta(html: str) -> dict:

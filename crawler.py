@@ -334,6 +334,70 @@ def _run(job_id: str):
                                     key=lambda r: r.get("アプリ性スコア", 0),
                                     reverse=True)
 
+        # ── Phase 6: 外部リンクチェック ──────────────────────────────
+        if "extlink" in check_types and n:
+            from fetcher import extract_links as _extract_links
+
+            page_ext: dict = {}
+            done = 0
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                def _collect_ext(url):
+                    c, html = fetch_html(url)
+                    if c != 200 or not html:
+                        return url, []
+                    all_links = _extract_links(html, url)
+                    return url, [lk for lk in all_links
+                                 if urlparse(lk).netloc not in (base_domain, "")]
+                futs = {ex.submit(_collect_ext, u): u for u in urls}
+                for f in as_completed(futs):
+                    pg, ext = f.result()
+                    page_ext[pg] = ext
+                    done += 1
+                    _upd(job_id,
+                         phase=f"外部リンク収集中 ({done}/{n})",
+                         progress=70 + round(done / n * 10))
+                    time.sleep(REQUEST_DELAY)
+
+            all_ext_urls = list({lk for links in page_ext.values() for lk in links})
+
+            def _ping_ext(url):
+                c, _ = fetch_html(url)
+                return url, c
+
+            ext_status: dict = {}
+            done = 0
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = {ex.submit(_ping_ext, u): u for u in all_ext_urls}
+                for f in as_completed(futs):
+                    u, c = f.result()
+                    ext_status[u] = c
+                    done += 1
+                    _upd(job_id,
+                         phase=f"外部リンク確認中 ({done}/{max(len(all_ext_urls), 1)})",
+                         progress=80 + round(done / max(len(all_ext_urls), 1) * 15))
+                    time.sleep(REQUEST_DELAY)
+
+            ext_rows = []
+            for src in sorted(page_ext):
+                for ext_url in page_ext[src]:
+                    c = ext_status.get(ext_url, 0)
+                    if c in (404, 410):
+                        judgment = "❌ 切れ"
+                    elif c == 403:
+                        judgment = "🔒 アクセス制限"
+                    elif c == 0:
+                        judgment = "⚠️ 確認不可"
+                    else:
+                        judgment = "✅ 正常"
+                    ext_rows.append({
+                        "発見ページ": src,
+                        "外部リンクURL": ext_url,
+                        "ドメイン": urlparse(ext_url).netloc,
+                        "ステータス": c,
+                        "判定": judgment,
+                    })
+            results["extlink"] = ext_rows
+
         _upd(job_id,
              status="done",
              phase="完了",
