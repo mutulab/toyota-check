@@ -110,6 +110,7 @@ def _run(job_id: str):
         psi_key     = cfg.get("psi_key", "")
         strategy    = cfg.get("strategy", "mobile")
         custom_raw  = cfg.get("custom_dict", "")
+        path_filter = cfg.get("path_filter", "")
         base_domain = urlparse(start_url).netloc
         # Excel mode: derive base_domain from first supplied URL
         if not base_domain and cfg.get("url_source_type") == "excel":
@@ -140,17 +141,21 @@ def _run(job_id: str):
                 visited.add(norm)
                 code, html = fetch_html(url)
                 if code == 200 and html:
-                    urls.append(url)
-                    _upd(job_id,
-                         urls=urls[:],
-                         url_count=len(urls),
-                         progress=round(len(urls) / max_pages * 30))
+                    _url_path = urlparse(url).path
+                    if not path_filter or _url_path.startswith(path_filter):
+                        urls.append(url)
+                        _upd(job_id,
+                             urls=urls[:],
+                             url_count=len(urls),
+                             progress=round(len(urls) / max_pages * 30))
                     if depth < max_depth:
                         for link in extract_links(html, url):
-                            if urlparse(link).netloc == base_domain:
-                                c = link.rstrip("/").split("?")[0].split("#")[0]
-                                if c not in visited:
-                                    queue.append((link, depth + 1))
+                            _lp = urlparse(link)
+                            if _lp.netloc == base_domain:
+                                if not path_filter or _lp.path.startswith(path_filter):
+                                    c = link.rstrip("/").split("?")[0].split("#")[0]
+                                    if c not in visited:
+                                        queue.append((link, depth + 1))
                 time.sleep(REQUEST_DELAY)
 
         n = len(urls)

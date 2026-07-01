@@ -99,6 +99,13 @@ with st.sidebar:
             bg_cfg["start_url"] = st.text_input("開始URL", value="https://toyota.jp/")
             bg_cfg["max_pages"] = st.slider("最大収集ページ数", 10, 1000, 100)
             bg_cfg["depth"]     = int(st.number_input("クロール深さ", 1, 4, 2))
+            bg_cfg["path_filter"] = st.text_input(
+                "パス制限（任意）",
+                value="",
+                placeholder="/prius/",
+                help="指定したパスで始まるURLのみ収集・巡回します。空欄=ドメイン全体",
+                key="bg_path_filter",
+            ).strip()
         else:
             bg_cfg["url_source_type"] = "excel"
             bg_cfg["start_url"] = ""
@@ -182,6 +189,7 @@ with st.sidebar:
         crawl_start = ""
         crawl_max = 100
         crawl_depth = 2
+        crawl_path_filter = ""
 
         if url_source == "Excelファイルをアップロード":
             uploaded_file = st.file_uploader(
@@ -202,6 +210,12 @@ with st.sidebar:
                                   help="まず50前後で試してください")
             crawl_depth = st.number_input("クロール深さ（階層数）", min_value=1, max_value=4, value=2,
                                           help="1=直リンクのみ / 2=その先も辿る")
+            crawl_path_filter = st.text_input(
+                "パス制限（任意）",
+                value="",
+                placeholder="/prius/",
+                help="指定したパスで始まるURLのみ収集・巡回します。空欄=ドメイン全体",
+            ).strip()
             limit = 0
 
         # ── リンクチェック: リソース種別選択 ───────────────────────────
@@ -557,7 +571,8 @@ else:  # 🕷️ クロール
     queue: deque = deque([(crawl_start.rstrip("/"), 0)])
     urls: list = []
 
-    st.info(f"**{crawl_start}** からクロール中（最大 {crawl_max} ページ、深さ {crawl_depth}）")
+    _path_label = f"、パス: `{crawl_path_filter}`" if crawl_path_filter else ""
+    st.info(f"**{crawl_start}** からクロール中（最大 {crawl_max} ページ、深さ {crawl_depth}{_path_label}）")
     crawl_progress = st.progress(0, text="クロール中...")
     crawl_status = st.empty()
 
@@ -570,19 +585,23 @@ else:  # 🕷️ クロール
 
         code, html = fetch_html(url)
         if code == 200 and html:
-            urls.append(url)
-            crawl_progress.progress(
-                min(len(urls) / crawl_max, 1.0),
-                text=f"収集中... {len(urls)} / {crawl_max} ページ",
-            )
-            crawl_status.caption(f"→ {url}")
+            _url_path = urlparse(url).path
+            if not crawl_path_filter or _url_path.startswith(crawl_path_filter):
+                urls.append(url)
+                crawl_progress.progress(
+                    min(len(urls) / crawl_max, 1.0),
+                    text=f"収集中... {len(urls)} / {crawl_max} ページ",
+                )
+                crawl_status.caption(f"→ {url}")
 
             if depth < crawl_depth:
                 for link in _extract_links(html, url):
-                    if urlparse(link).netloc == base_domain:
-                        clean = link.rstrip("/").split("?")[0].split("#")[0]
-                        if clean not in visited:
-                            queue.append((link, depth + 1))
+                    _lp = urlparse(link)
+                    if _lp.netloc == base_domain:
+                        if not crawl_path_filter or _lp.path.startswith(crawl_path_filter):
+                            clean = link.rstrip("/").split("?")[0].split("#")[0]
+                            if clean not in visited:
+                                queue.append((link, depth + 1))
 
         time.sleep(REQUEST_DELAY)
 
