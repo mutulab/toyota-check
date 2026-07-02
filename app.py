@@ -78,8 +78,8 @@ with st.sidebar:
     check_type = st.radio(
         "チェック種別",
         ["📄 タイトル取得", "🔗 リンクチェック", "🌐 外部リンクチェック",
-         "⚡ Core Web Vitals", "📝 表記ゆれ・禁止表現", "🔍 アプリ・機能検出",
-         "🕷️ バックグラウンドクロール"],
+         "📌 リンク元調査", "⚡ Core Web Vitals", "📝 表記ゆれ・禁止表現",
+         "🔍 アプリ・機能検出", "🕷️ バックグラウンドクロール"],
         index=0,
     )
 
@@ -129,12 +129,12 @@ with st.sidebar:
         bg_cfg["toyota_only"]  = st.checkbox("toyota.jpリンクのみ", value=True)
         _bg_checks = st.multiselect(
             "実行するチェック",
-            ["リンクチェック", "外部リンクチェック", "表記ゆれ・禁止表現",
-             "Core Web Vitals", "アプリ・機能検出"],
+            ["リンクチェック", "外部リンクチェック", "リンク元調査",
+             "表記ゆれ・禁止表現", "Core Web Vitals", "アプリ・機能検出"],
             default=["リンクチェック"],
         )
         _map = {"リンクチェック": "link", "外部リンクチェック": "extlink",
-                "表記ゆれ・禁止表現": "content",
+                "リンク元調査": "backlink", "表記ゆれ・禁止表現": "content",
                 "Core Web Vitals": "cwv", "アプリ・機能検出": "app"}
         bg_cfg["check_types"] = [_map[c] for c in _bg_checks]
         if "link" in bg_cfg["check_types"]:
@@ -154,6 +154,13 @@ with st.sidebar:
                 "カスタム辞書（誤表記|推奨表記）", height=80,
                 placeholder="ウエブサイト|WEBサイト", key="bg_dict",
             )
+        if "backlink" in bg_cfg["check_types"]:
+            bg_cfg["backlink_query"] = st.text_input(
+                "調査対象URL（部分一致）",
+                placeholder="/lecture/ または https://factory.kinto-jp.com/",
+                help="このURLパターンへのリンクを含むページを抽出します",
+                key="bg_bl_query",
+            ).strip()
         if "cwv" in bg_cfg["check_types"]:
             bg_cfg["strategy"] = st.radio("CWVデバイス", ["mobile", "desktop"],
                                           horizontal=True, key="bg_strat")
@@ -289,6 +296,19 @@ with st.sidebar:
             )
         else:
             custom_dict_raw = ""
+
+        if check_type == "📌 リンク元調査":
+            st.divider()
+            st.subheader("調査設定")
+            backlink_query = st.text_input(
+                "調査対象URL（部分一致）",
+                placeholder="/lecture/",
+                help="このURLパターンへのリンクを含むページを抽出します。\n"
+                     "例: /lecture/  →  href に /lecture/ を含むリンクを検出\n"
+                     "例: https://factory.kinto-jp.com/  →  外部リンクも検出",
+            ).strip()
+        else:
+            backlink_query = ""
 
         if check_type == "⚡ Core Web Vitals":
             strategy = st.radio("計測デバイス", ["mobile", "desktop"], horizontal=True)
@@ -433,6 +453,23 @@ if check_type == "🕷️ バックグラウンドクロール":
                                 st.dataframe(df_ex, use_container_width=True, height=300)
                             st.download_button("📥 外部リンク Excel", to_excel_bytes(df_ex),
                                                f"extlinks_{job_id_input}.xlsx", key="bg_dl_ex")
+
+                    if "backlink" in res:
+                        df_bl = pd.DataFrame(res["backlink"]) if res["backlink"] else pd.DataFrame()
+                        _bl_q = job["cfg"].get("backlink_query", "")
+                        _bl_pages = len(df_bl["発見ページURL"].unique()) if not df_bl.empty and "発見ページURL" in df_bl.columns else 0
+                        st.subheader(f"📌 リンク元調査「{_bl_q}」— {_bl_pages} ページで検出")
+                        if not df_bl.empty:
+                            st.dataframe(df_bl, use_container_width=True, height=300)
+                            c1, c2 = st.columns(2)
+                            c1.download_button("📥 Excel", to_excel_bytes(df_bl),
+                                               f"backlinks_{job_id_input}.xlsx", key="bg_dl_blx")
+                            c2.download_button("📥 CSV",
+                                               df_bl.to_csv(index=False).encode("utf-8-sig"),
+                                               f"backlinks_{job_id_input}.csv", mime="text/csv",
+                                               key="bg_dl_blc")
+                        else:
+                            st.info(f"「{_bl_q}」へのリンクは見つかりませんでした。")
 
                     if "content" in res:
                         df_c = pd.DataFrame(res["content"]) if res["content"] else pd.DataFrame()
@@ -1228,3 +1265,98 @@ elif check_type == "🔍 アプリ・機能検出":
         use_container_width=True,
         key="dl_app_csv",
     )
+
+# ════════════════════════════════════════
+# 📌 リンク元調査
+# ════════════════════════════════════════
+elif check_type == "📌 リンク元調査":
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from fetcher import extract_links as _bl_extract_links
+    from fetcher import extract_meta as _bl_extract_meta
+
+    if not backlink_query:
+        st.warning("サイドバーで「調査対象URL」を入力してください。")
+        st.stop()
+
+    st.info(
+        f"**{len(urls)} ページ**を対象に「`{backlink_query}`」へのリンクを探しています。\n\n"
+        "内部リンク・外部リンクの両方を対象とします。"
+    )
+    progress = st.progress(0, text="解析中...")
+
+    bl_found: list = []
+
+    def _bl_check(url):
+        code, html = fetch_html(url)
+        if code != 200 or not html:
+            return []
+        links = _bl_extract_links(html, url)
+        matched = [lk for lk in links if backlink_query in lk]
+        if not matched:
+            return []
+        meta = _bl_extract_meta(html)
+        return [
+            {"発見ページURL": url, "ページタイトル": meta["short_title"], "マッチしたリンク": lk}
+            for lk in dict.fromkeys(matched)  # 同一ページ内の重複リンクは1件に集約
+        ]
+
+    with ThreadPoolExecutor(max_workers=CONCURRENT_WORKERS) as ex:
+        futs = {ex.submit(_bl_check, u): u for u in urls}
+        done = 0
+        for f in as_completed(futs):
+            bl_found.extend(f.result())
+            done += 1
+            progress.progress(done / len(urls), text=f"解析中... {done}/{len(urls)}")
+            time.sleep(REQUEST_DELAY)
+
+    progress.empty()
+
+    pages_with_link = list(dict.fromkeys(r["発見ページURL"] for r in bl_found))
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("調査ページ数", len(urls))
+    c2.metric("📌 リンク元ページ数", len(pages_with_link))
+    c3.metric("マッチリンク総数", len(bl_found))
+
+    if bl_found:
+        df_bl = pd.DataFrame(bl_found)
+
+        st.subheader(f"「{backlink_query}」へのリンクを含むページ一覧")
+
+        # ページ単位サマリ（1ページ1行）
+        df_bl_summary = (
+            df_bl.groupby(["発見ページURL", "ページタイトル"])["マッチしたリンク"]
+            .count().reset_index()
+            .rename(columns={"マッチしたリンク": "リンク数"})
+            .sort_values("リンク数", ascending=False)
+        )
+        st.dataframe(df_bl_summary, use_container_width=True, height=350)
+
+        with st.expander(f"マッチしたリンク詳細（{len(bl_found)} 件）"):
+            st.dataframe(df_bl, use_container_width=True, height=350)
+
+        c1x, c2x = st.columns(2)
+        c1x.download_button(
+            "📥 Excel（サマリ）",
+            to_excel_bytes(df_bl_summary),
+            "backlinks_summary.xlsx",
+            use_container_width=True,
+            key="dl_bl_sum_x",
+        )
+        c2x.download_button(
+            "📥 Excel（詳細）",
+            to_excel_bytes(df_bl),
+            "backlinks_detail.xlsx",
+            use_container_width=True,
+            key="dl_bl_det_x",
+        )
+        st.download_button(
+            "📥 CSV（詳細）",
+            df_bl.to_csv(index=False).encode("utf-8-sig"),
+            "backlinks_detail.csv",
+            mime="text/csv",
+            use_container_width=True,
+            key="dl_bl_det_c",
+        )
+    else:
+        st.success(f"「{backlink_query}」へのリンクを含むページは見つかりませんでした。")

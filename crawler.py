@@ -403,6 +403,36 @@ def _run(job_id: str):
                     })
             results["extlink"] = ext_rows
 
+        # ── Phase 7: リンク元調査（逆引き） ──────────────────────────
+        if "backlink" in check_types and n:
+            bq = cfg.get("backlink_query", "").strip()
+            if bq:
+                from fetcher import extract_links as _bl_links
+
+                bl_rows: list = []
+                done = 0
+                with ThreadPoolExecutor(max_workers=workers) as ex:
+                    def _bl(url):
+                        c, html = fetch_html(url)
+                        if c != 200 or not html:
+                            return []
+                        meta = extract_meta(html)
+                        matched = list(dict.fromkeys(
+                            lk for lk in _bl_links(html, url) if bq in lk
+                        ))
+                        return [{"発見ページURL": url,
+                                 "ページタイトル": meta["short_title"],
+                                 "マッチしたリンク": lk} for lk in matched]
+                    futs = {ex.submit(_bl, u): u for u in urls}
+                    for f in as_completed(futs):
+                        bl_rows.extend(f.result())
+                        done += 1
+                        _upd(job_id,
+                             phase=f"リンク元調査中 ({done}/{n})",
+                             progress=65 + round(done / n * 20))
+                        time.sleep(REQUEST_DELAY)
+                results["backlink"] = bl_rows
+
         _upd(job_id,
              status="done",
              phase="完了",
