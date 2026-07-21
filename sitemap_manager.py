@@ -11,13 +11,112 @@ tjpコンテンツ管理表.xlsx（運用サイトマップ）をアプリ上で
 from __future__ import annotations
 
 import io
+import json
 import re
 import time
 from collections import deque
-from datetime import date
+from datetime import date, datetime
+from pathlib import Path
 from urllib.parse import urlparse, urljoin, urldefrag
 
 import pandas as pd
+
+# ─── 永続ストレージ ──────────────────────────────────────────
+STORE_DIR = Path(__file__).parent / "data"
+STORE_CSV = STORE_DIR / "sitemap_master.csv"
+META_JSON = STORE_DIR / "sitemap_meta.json"
+GH_PATH = "data/sitemap_master.csv"
+
+
+def _gh_cfg():
+    """GitHubバックアップ設定（st.secrets に GITHUB_TOKEN があれば有効）。"""
+    try:
+        import streamlit as st
+        tok = st.secrets.get("GITHUB_TOKEN", "")
+        repo = st.secrets.get("GITHUB_REPO", "mutulab/toyota-check")
+        return (tok, repo) if tok else None
+    except Exception:
+        return None
+
+
+def load_store() -> tuple[pd.DataFrame | None, dict]:
+    """保存済みマスタを読み込む（ローカル → 無ければGitHubから復元）。"""
+    meta: dict = {}
+    if META_JSON.exists():
+        try:
+            meta = json.loads(META_JSON.read_text(encoding="utf-8"))
+        except Exception:
+            meta = {}
+    if STORE_CSV.exists():
+        return pd.read_csv(STORE_CSV, dtype="string").fillna(pd.NA), meta
+
+    gh = _gh_cfg()
+    if gh:
+        import requests
+        tok, repo = gh
+        try:
+            r = requests.get(
+                f"https://api.github.com/repos/{repo}/contents/{GH_PATH}",
+                headers={"Authorization": f"Bearer {tok}",
+                         "Accept": "application/vnd.github.raw"},
+                timeout=20)
+            if r.status_code == 200:
+                STORE_DIR.mkdir(exist_ok=True)
+                STORE_CSV.write_bytes(r.content)
+                meta["restored_from_github"] = True
+                return pd.read_csv(STORE_CSV, dtype="string").fillna(pd.NA), meta
+        except Exception:
+            pass
+    return None, meta
+
+
+def _gh_push(action: str) -> bool:
+    """マスタCSVをGitHubへバックアップ（再デプロイ後も残す）。"""
+    gh = _gh_cfg()
+    if not gh:
+        return False
+    import base64
+    import requests
+    tok, repo = gh
+    url = f"https://api.github.com/repos/{repo}/contents/{GH_PATH}"
+    hdr = {"Authorization": f"Bearer {tok}",
+           "Accept": "application/vnd.github+json"}
+    try:
+        sha = None
+        r = requests.get(url, headers=hdr, timeout=20)
+        if r.status_code == 200:
+            sha = r.json().get("sha")
+        body = {"message": f"data: サイトマップマスタ更新（{action}）",
+                "content": base64.b64encode(STORE_CSV.read_bytes()).decode()}
+        if sha:
+            body["sha"] = sha
+        r = requests.put(url, headers=hdr, json=body, timeout=30)
+        return r.status_code in (200, 201)
+    except Exception:
+        return False
+
+
+def save_store(df: pd.DataFrame, action: str) -> tuple[dict, str]:
+    """マスタを保存し、更新履歴を記録。GitHub連携があればバックアップも実行。"""
+    STORE_DIR.mkdir(exist_ok=True)
+    df.to_csv(STORE_CSV, index=False)
+    meta: dict = {}
+    if META_JSON.exists():
+        try:
+            meta = json.loads(META_JSON.read_text(encoding="utf-8"))
+        except Exception:
+            meta = {}
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    meta["last_updated"] = ts
+    meta["last_action"] = action
+    meta["rows"] = len(df)
+    meta.setdefault("history", []).append({"日時": ts, "操作": action, "件数": len(df)})
+    meta["history"] = meta["history"][-50:]
+    META_JSON.write_text(json.dumps(meta, ensure_ascii=False, indent=1),
+                         encoding="utf-8")
+    backed = _gh_push(action)
+    dest = "ローカル＋GitHubバックアップ済み" if backed else "アプリ内ストレージ"
+    return meta, dest
 
 SHEET_NAME = "運用サイトマップ"
 HEADER_ROW = 5          # 見出し行（1始まり）
@@ -260,28 +359,58 @@ def render():
     import streamlit as st
 
     st.header("🗂️ サイトマップ管理")
-    st.caption("tjpコンテンツ管理表（運用サイトマップ）の閲覧・編集・クロール差分検知")
+    st.caption("運用サイトマップのマスタをアプリ内に保持し、閲覧・編集・クロール差分検知で更新する管理ツール")
 
-    # ── 1. 読み込み ──
-    up = st.file_uploader("tjpコンテンツ管理表.xlsx をアップロード", type=["xlsx"],
-                          key="smgr_upload")
-    if up is not None:
-        fkey = f"{up.name}_{up.size}"
-        if st.session_state.get("smgr_fkey") != fkey:
-            try:
-                df, headers = load_sitemap(up)
-            except Exception as e:
-                st.error(f"読み込みエラー: {e}")
-                return
-            st.session_state["smgr_df"] = df
-            st.session_state["smgr_fkey"] = fkey
-            st.session_state.pop("smgr_new_urls", None)
+    # ── 1. マスタ読み込み（保存済みを自動ロード） ──
+    if "smgr_df" not in st.session_state:
+        stored, meta = load_store()
+        if stored is not None:
+            st.session_state["smgr_df"] = stored
+            st.session_state["smgr_meta"] = meta
 
     df: pd.DataFrame | None = st.session_state.get("smgr_df")
+    meta: dict = st.session_state.get("smgr_meta", {})
+
+    # ── 取り込み・差し替え（マスタ未登録時のみ展開） ──
+    with st.expander("📥 Excelからマスタを取り込み・差し替え", expanded=(df is None)):
+        st.caption("tjpコンテンツ管理表.xlsx（運用サイトマップシート）を読み込み、"
+                   "アプリ内のマスタとして保存します。以降はアップロード不要です。")
+        up = st.file_uploader("tjpコンテンツ管理表.xlsx", type=["xlsx"], key="smgr_upload")
+        if up is not None:
+            try:
+                new_df, _ = load_sitemap(up)
+                st.caption(f"読み込みプレビュー: {len(new_df)} 件のURL")
+                label = "⚠️ 現在のマスタを差し替えて保存" if df is not None else "💾 マスタとして保存"
+                if st.button(label, type="primary", key="smgr_import_btn"):
+                    meta, dest = save_store(new_df, f"Excel取り込み（{up.name}）")
+                    st.session_state["smgr_df"] = new_df
+                    st.session_state["smgr_meta"] = meta
+                    st.session_state.pop("smgr_new_urls", None)
+                    st.success(f"マスタとして保存しました（{len(new_df)}件・{dest}）")
+                    st.rerun()
+            except Exception as e:
+                st.error(f"読み込みエラー: {e}")
+
     if df is None:
-        st.info("コンテンツ管理表（.xlsx）をアップロードしてください。"
-                "編集内容はセッション中保持され、CSV / Excel でダウンロードできます。")
+        st.info("まだマスタが登録されていません。上の「📥 取り込み」から "
+                "tjpコンテンツ管理表.xlsx を一度だけ取り込んでください。")
         return
+
+    # ── マスタ状態表示 ──
+    gh_on = _gh_cfg() is not None
+    st.caption(
+        f"🗄️ **マスタ保持中**: {len(df)} 件　｜　最終更新: "
+        f"{meta.get('last_updated', 'ー')}（{meta.get('last_action', 'ー')}）　｜　"
+        f"保存先: {'アプリ内＋GitHubバックアップ' if gh_on else 'アプリ内ストレージ'}")
+    if not gh_on:
+        st.warning("GitHubバックアップが未設定です。Streamlit Cloudの再デプロイ時にマスタが"
+                   "初期化される可能性があります。Secretsに `GITHUB_TOKEN`（repo権限）を"
+                   "設定すると自動バックアップ・自動復元が有効になります。", icon="⚠️")
+    hist = meta.get("history", [])
+    if hist:
+        with st.expander(f"🕘 更新履歴（直近{min(len(hist), 10)}件）"):
+            st.dataframe(pd.DataFrame(list(reversed(hist))[:10]),
+                         use_container_width=True, hide_index=True)
 
     dfd = add_derived(df)
 
@@ -366,7 +495,7 @@ def render():
             num_rows="dynamic", key="smgr_editor",
             disabled=["種別判定", "階層深さ"] + lvl_cols,
         )
-        if st.button("💾 編集内容を保存（セッションに反映）", type="primary"):
+        if st.button("💾 編集内容をマスタに保存", type="primary"):
             base = df.copy()
             editable = [c for c in edited.columns
                         if c in base.columns and c not in ("種別判定", "階層深さ")]
@@ -376,9 +505,11 @@ def render():
             new_rows = new_rows[new_rows[URL_COL_NAME].notna()]
             if len(new_rows):
                 base = pd.concat([base, new_rows], ignore_index=True)
+            meta2, dest = save_store(
+                base, f"一覧編集（更新{len(common)}行・追加{len(new_rows)}行）")
             st.session_state["smgr_df"] = base
-            st.success(f"保存しました（更新 {len(common)} 行・追加 {len(new_rows)} 行）。"
-                       "ダウンロードで書き出せます。")
+            st.session_state["smgr_meta"] = meta2
+            st.success(f"マスタに保存しました（更新 {len(common)} 行・追加 {len(new_rows)} 行・{dest}）")
             st.rerun()
 
     # ── 5. ダウンロード ──
@@ -444,12 +575,13 @@ def render():
                             row[src_col] = f"クロール検知 {date.today()}"
                         rows.append(row)
                     base = pd.concat([base, pd.DataFrame(rows)], ignore_index=True)
+                    meta2, dest = save_store(base, f"クロール検知 {len(rows)}件追加")
                     st.session_state["smgr_df"] = base
+                    st.session_state["smgr_meta"] = meta2
                     st.session_state["smgr_new_urls"] = [
                         u for u in new_urls
                         if u["フルURL"] not in set(add["フルURL"])]
-                    st.success(f"{len(rows)} 件を一覧に追加しました。"
-                               "ダウンロードでExcel/CSVに書き出せます。")
+                    st.success(f"{len(rows)} 件をマスタに追加・保存しました（{dest}）")
                     st.rerun()
                 a2.download_button("⬇️ 検知結果をCSV", to_csv_bytes(nd.drop(columns=['追加'])),
                                    f"crawl_new_urls_{date.today()}.csv", "text/csv",

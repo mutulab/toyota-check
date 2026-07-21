@@ -5,3 +5,4 @@ __pycache__/
 .DS_Store
 *.xlsx
 !hyoki_dict.xlsx
+data/
