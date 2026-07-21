@@ -70,11 +70,11 @@ def load_store() -> tuple[pd.DataFrame | None, dict]:
     return None, meta
 
 
-def _gh_push(action: str) -> bool:
-    """マスタCSVをGitHubへバックアップ（再デプロイ後も残す）。"""
+def _gh_push(action: str) -> tuple[bool, str]:
+    """マスタCSVをGitHubへバックアップ。(成功可否, 失敗理由) を返す。"""
     gh = _gh_cfg()
     if not gh:
-        return False
+        return False, "GITHUB_TOKEN未設定"
     import base64
     import requests
     tok, repo = gh
@@ -86,14 +86,18 @@ def _gh_push(action: str) -> bool:
         r = requests.get(url, headers=hdr, timeout=20)
         if r.status_code == 200:
             sha = r.json().get("sha")
+        elif r.status_code not in (404,):
+            return False, f"GitHub照会エラー HTTP {r.status_code}: {r.json().get('message', '')}"
         body = {"message": f"data: サイトマップマスタ更新（{action}）",
                 "content": base64.b64encode(STORE_CSV.read_bytes()).decode()}
         if sha:
             body["sha"] = sha
         r = requests.put(url, headers=hdr, json=body, timeout=30)
-        return r.status_code in (200, 201)
-    except Exception:
-        return False
+        if r.status_code in (200, 201):
+            return True, ""
+        return False, f"GitHub書き込みエラー HTTP {r.status_code}: {r.json().get('message', '')}"
+    except Exception as e:
+        return False, f"通信エラー: {e}"
 
 
 def save_store(df: pd.DataFrame, action: str) -> tuple[dict, str]:
@@ -114,9 +118,9 @@ def save_store(df: pd.DataFrame, action: str) -> tuple[dict, str]:
     meta["history"] = meta["history"][-50:]
     META_JSON.write_text(json.dumps(meta, ensure_ascii=False, indent=1),
                          encoding="utf-8")
-    backed = _gh_push(action)
-    dest = "ローカル＋GitHubバックアップ済み" if backed else "アプリ内ストレージ"
-    return meta, dest
+    backed, gh_err = _gh_push(action)
+    dest = "ローカル＋GitHubバックアップ済み" if backed else "アプリ内ストレージのみ"
+    return meta, dest, gh_err
 
 SHEET_NAME = "運用サイトマップ"
 HEADER_ROW = 5          # 見出し行（1始まり）
@@ -361,6 +365,12 @@ def render():
     st.header("🗂️ サイトマップ管理")
     st.caption("運用サイトマップのマスタをアプリ内に保持し、閲覧・編集・クロール差分検知で更新する管理ツール")
 
+    # 保存後の通知（rerun後も残す）
+    if msg := st.session_state.pop("smgr_flash", None):
+        st.success(msg)
+    if warn := st.session_state.pop("smgr_flash_warn", None):
+        st.warning(warn)
+
     # ── 1. マスタ読み込み（保存済みを自動ロード） ──
     if "smgr_df" not in st.session_state:
         stored, meta = load_store()
@@ -382,11 +392,15 @@ def render():
                 st.caption(f"読み込みプレビュー: {len(new_df)} 件のURL")
                 label = "⚠️ 現在のマスタを差し替えて保存" if df is not None else "💾 マスタとして保存"
                 if st.button(label, type="primary", key="smgr_import_btn"):
-                    meta, dest = save_store(new_df, f"Excel取り込み（{up.name}）")
+                    meta, dest, gh_err = save_store(new_df, f"Excel取り込み（{up.name}）")
                     st.session_state["smgr_df"] = new_df
                     st.session_state["smgr_meta"] = meta
                     st.session_state.pop("smgr_new_urls", None)
-                    st.success(f"マスタとして保存しました（{len(new_df)}件・{dest}）")
+                    st.session_state["smgr_flash"] = \
+                        f"マスタとして保存しました（{len(new_df)}件・{dest}）"
+                    if gh_err:
+                        st.session_state["smgr_flash_warn"] = \
+                            f"GitHubバックアップは失敗しました: {gh_err}"
                     st.rerun()
             except Exception as e:
                 st.error(f"読み込みエラー: {e}")
@@ -505,11 +519,14 @@ def render():
             new_rows = new_rows[new_rows[URL_COL_NAME].notna()]
             if len(new_rows):
                 base = pd.concat([base, new_rows], ignore_index=True)
-            meta2, dest = save_store(
+            meta2, dest, gh_err = save_store(
                 base, f"一覧編集（更新{len(common)}行・追加{len(new_rows)}行）")
             st.session_state["smgr_df"] = base
             st.session_state["smgr_meta"] = meta2
-            st.success(f"マスタに保存しました（更新 {len(common)} 行・追加 {len(new_rows)} 行・{dest}）")
+            st.session_state["smgr_flash"] = \
+                f"マスタに保存しました（更新 {len(common)} 行・追加 {len(new_rows)} 行・{dest}）"
+            if gh_err:
+                st.session_state["smgr_flash_warn"] = f"GitHubバックアップは失敗しました: {gh_err}"
             st.rerun()
 
     # ── 5. ダウンロード ──
@@ -575,13 +592,17 @@ def render():
                             row[src_col] = f"クロール検知 {date.today()}"
                         rows.append(row)
                     base = pd.concat([base, pd.DataFrame(rows)], ignore_index=True)
-                    meta2, dest = save_store(base, f"クロール検知 {len(rows)}件追加")
+                    meta2, dest, gh_err = save_store(base, f"クロール検知 {len(rows)}件追加")
                     st.session_state["smgr_df"] = base
                     st.session_state["smgr_meta"] = meta2
                     st.session_state["smgr_new_urls"] = [
                         u for u in new_urls
                         if u["フルURL"] not in set(add["フルURL"])]
-                    st.success(f"{len(rows)} 件をマスタに追加・保存しました（{dest}）")
+                    st.session_state["smgr_flash"] = \
+                        f"{len(rows)} 件をマスタに追加・保存しました（{dest}）"
+                    if gh_err:
+                        st.session_state["smgr_flash_warn"] = \
+                            f"GitHubバックアップは失敗しました: {gh_err}"
                     st.rerun()
                 a2.download_button("⬇️ 検知結果をCSV", to_csv_bytes(nd.drop(columns=['追加'])),
                                    f"crawl_new_urls_{date.today()}.csv", "text/csv",
