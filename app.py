@@ -417,7 +417,32 @@ if check_type == "🕷️ バックグラウンドクロール":
 
     with tab_new:
         st.subheader("ジョブ設定")
-        st.json({k: v for k, v in bg_cfg.items() if k != "psi_key"})
+        _ct_ja = {"link": "リンクチェック", "extlink": "外部リンクチェック",
+                  "backlink": "リンク元調査", "content": "表記ゆれ・禁止表現",
+                  "cwv": "Core Web Vitals", "app": "アプリ・機能検出"}
+        _rows = []
+        if bg_cfg.get("url_source_type") == "crawl":
+            _rows.append(("URL取得方法", "クロール（自動収集）"))
+            _rows.append(("開始URL", bg_cfg.get("start_url", "")))
+            _rows.append(("最大収集ページ数", f'{bg_cfg.get("max_pages", 0)} ページ'))
+            _rows.append(("クロール深さ", str(bg_cfg.get("depth", ""))))
+            if bg_cfg.get("path_filter"):
+                _rows.append(("パス制限", bg_cfg["path_filter"]))
+        else:
+            _rows.append(("URL取得方法", "コンテンツ管理票（Excel）"))
+            _rows.append(("対象URL数", f'{len(bg_cfg.get("urls", []))} 件'))
+        _rows.append(("toyota.jpのみ", "はい" if bg_cfg.get("toyota_only") else "いいえ"))
+        _rows.append(("実行するチェック",
+                      "、".join(_ct_ja.get(c, c) for c in bg_cfg.get("check_types", [])) or "（未選択）"))
+        if bg_cfg.get("selected_res"):
+            _rows.append(("リンクチェック対象", "、".join(bg_cfg["selected_res"])))
+        if bg_cfg.get("backlink_query"):
+            _rows.append(("リンク元調査の対象", bg_cfg["backlink_query"]))
+        if "cwv" in bg_cfg.get("check_types", []):
+            _rows.append(("CWVデバイス", bg_cfg.get("strategy", "mobile")))
+        if bg_cfg.get("custom_dict"):
+            _rows.append(("カスタム辞書", f'{len(bg_cfg["custom_dict"].splitlines())} 行'))
+        st.table(pd.DataFrame(_rows, columns=["項目", "設定値"]).set_index("項目"))
         if run_btn:  # サイドバーの「▶ チェック実行」= ジョブ開始
             if bg_cfg.get("url_source_type") == "excel" and not bg_cfg.get("urls"):
                 st.error("コンテンツ管理票のExcelをアップロードしてください。")
