@@ -202,6 +202,43 @@ def crawl_discover(existing_norm: set[str], start_url: str, path_filter: str,
     return sorted(found.values(), key=lambda d: d["フルURL"])
 
 
+def build_tree(dfd: pd.DataFrame, level: int) -> pd.DataFrame:
+    """パス順に並べ、インデント付きツリー列と配下ページ数を持つ表を作る。
+
+    level より深い行は畳む（親の「配下ページ数」に含まれるため情報は失われない）。
+    """
+    d = dfd.copy()
+    d["_segs"] = d[URL_COL_NAME].map(lambda u: tuple(s for s in path_levels(u) if s))
+    d = d.sort_values("_segs", kind="stable").reset_index(drop=True)
+
+    # 配下ページ数: 自分のパスを接頭辞とする行数（自分を除く）
+    seg_list = list(d["_segs"])
+    counts = []
+    for segs in seg_list:
+        n = sum(1 for o in seg_list if len(o) > len(segs) and o[:len(segs)] == segs)
+        counts.append(n)
+    d["配下ページ数"] = counts
+
+    shown = d[d["階層深さ"] <= level].copy()
+
+    def tree_label(row):
+        segs = row["_segs"]
+        depth = len(segs)
+        if depth == 0:
+            return "🏠 toyota.jp（トップ）"
+        name = segs[-1]
+        url = str(row[URL_COL_NAME])
+        is_dir = url.rstrip("/").endswith(name) and url.endswith("/")
+        icon = "📁 " if (is_dir or row["配下ページ数"] > 0) else "📄 "
+        return "　　" * (depth - 1) + "└ " + icon + name + ("/" if is_dir else "")
+
+    shown["ツリー"] = shown.apply(tree_label, axis=1)
+    folded = shown["配下ページ数"].where(shown["階層深さ"] == level, 0)
+    shown["畳まれた配下"] = folded.map(lambda n: f"+{n}件" if n else "")
+    cols = ["ツリー", "配下ページ数", "畳まれた配下", "種別判定", "ページ説明", URL_COL_NAME]
+    return shown[[c for c in cols if c in shown.columns]]
+
+
 def to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8-sig")
 
@@ -258,18 +295,22 @@ def render():
 
     # ── 3. ビュー設定 ──
     st.divider()
-    f1, f2, f3, f4 = st.columns([1.2, 1, 1.2, 1.6])
-    view_mode = f1.radio("表示モード", ["URL一覧（編集可）", "ディレクトリ集計"],
+    f1, f2, f3, f4 = st.columns([1.4, 1.2, 1.2, 1.4])
+    view_mode = f1.radio("表示モード",
+                         ["🌲 ツリービュー", "✏️ 一覧編集", "📊 ディレクトリ集計"],
                          key="smgr_mode")
-    level = f2.slider("表示階層（第n階層まで）", 1, MAX_LEVEL, MAX_LEVEL,
-                      key="smgr_level")
+    level = f2.select_slider("表示階層",
+                             options=list(range(1, MAX_LEVEL + 1)), value=MAX_LEVEL,
+                             format_func=lambda n: f"第{n}階層まで",
+                             key="smgr_level")
     dir1 = f3.selectbox(
         "第1階層で絞り込み",
         ["（すべて）"] + sorted(x for x in dfd["階層1"].unique() if x),
         key="smgr_dir1")
     q = f4.text_input("URL・説明で検索", key="smgr_q").strip()
 
-    view = dfd[dfd["階層深さ"] <= level]
+    # 絞り込みは「検索・第1階層」のみ。階層スライダーで行が消えるのはツリーの折り畳みだけ
+    view = dfd
     if dir1 != "（すべて）":
         view = view[view["階層1"] == dir1]
     if q:
@@ -278,19 +319,48 @@ def render():
                     .astype(str).str.contains(q, case=False, na=False))
         view = view[mask]
 
+    filtered = len(view) != len(dfd)
+    fc1, fc2 = st.columns([4, 1])
+    fc1.caption(f"全 {len(dfd)} 件中 **{len(view)} 件** を表示"
+                + ("（絞り込み中）" if filtered else ""))
+    if filtered and fc2.button("絞り込み解除", key="smgr_reset"):
+        st.session_state["smgr_dir1"] = "（すべて）"
+        st.session_state["smgr_q"] = ""
+        st.rerun()
+
     # ── 4. 表示・編集 ──
-    if view_mode == "ディレクトリ集計":
-        st.subheader(f"ディレクトリ集計（第{level}階層まで・{len(view)} URL）")
+    if view_mode == "📊 ディレクトリ集計":
+        st.subheader(f"ディレクトリ集計（第{level}階層まで）")
         agg = agg_directories(view, level)
         st.dataframe(agg, use_container_width=True, height=480)
         st.download_button("⬇️ この集計をCSVダウンロード", to_csv_bytes(agg),
                            f"sitemap_dir_level{level}_{date.today()}.csv", "text/csv")
+    elif view_mode == "🌲 ツリービュー":
+        tree = build_tree(view, level)
+        hidden = len(view) - len(tree)
+        st.subheader(f"ツリービュー（第{level}階層まで表示・{len(tree)} 行）")
+        if hidden:
+            st.caption(f"※ 第{level + 1}階層より深い {hidden} 件は畳んでいます"
+                       "（「畳まれた配下」列に件数表示。表示階層を上げると展開）")
+        st.dataframe(
+            tree, use_container_width=True, height=520, hide_index=True,
+            column_config={
+                "ツリー": st.column_config.TextColumn("サイト構造", width="large"),
+                "配下ページ数": st.column_config.NumberColumn("配下", width="small"),
+                "畳まれた配下": st.column_config.TextColumn("畳み", width="small"),
+                "種別判定": st.column_config.TextColumn("種別", width="small"),
+                URL_COL_NAME: st.column_config.LinkColumn("URL", width="medium"),
+            },
+        )
+        st.download_button("⬇️ このツリーをCSV", to_csv_bytes(tree),
+                           f"sitemap_tree_level{level}_{date.today()}.csv", "text/csv",
+                           key="smgr_tree_csv")
     else:
         show_all = st.checkbox("全列を表示（Excelの全項目）", key="smgr_allcols")
         lvl_cols = [f"階層{i + 1}" for i in range(level)]
         cols = ([c for c in VIEW_COLS if c in view.columns] + lvl_cols) if not show_all \
             else list(view.columns)
-        st.subheader(f"URL一覧（{len(view)} 件）")
+        st.subheader(f"一覧編集（{len(view)} 件）")
         edited = st.data_editor(
             view[cols], use_container_width=True, height=480,
             num_rows="dynamic", key="smgr_editor",
@@ -313,9 +383,8 @@ def render():
 
     # ── 5. ダウンロード ──
     d1, d2, d3 = st.columns(3)
-    d1.download_button("⬇️ 表示中ビューをCSV", to_csv_bytes(
-        view if view_mode != "ディレクトリ集計" else agg_directories(view, level)),
-        f"sitemap_view_{date.today()}.csv", "text/csv")
+    d1.download_button("⬇️ 表示中の絞り込み結果をCSV", to_csv_bytes(view),
+                       f"sitemap_view_{date.today()}.csv", "text/csv")
     d2.download_button("⬇️ 全件CSV（判定・階層列つき）", to_csv_bytes(add_derived(df)),
                        f"sitemap_all_{date.today()}.csv", "text/csv")
     d3.download_button("⬇️ Excel（編集反映済み）", to_excel_bytes(df),
