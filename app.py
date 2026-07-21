@@ -132,10 +132,49 @@ with st.sidebar:
 
         _bg_url_src = st.radio(
             "URL取得方法",
-            ["🕷️ クロール（自動収集）", "📊 コンテンツ管理票（Excel）"],
+            ["🗂️ サイトマップマスタ（アプリ内保持）", "🕷️ クロール（自動収集）",
+             "📊 コンテンツ管理票（Excel）"],
             key="bg_url_src",
         )
-        if _bg_url_src.startswith("🕷"):
+        if _bg_url_src.startswith("🗂"):
+            # サイトマップ管理で保持しているマスタを対象URLにする
+            bg_cfg["url_source_type"] = "excel"
+            bg_cfg["start_url"] = ""
+            try:
+                import sitemap_manager as _smm
+                _mdf = st.session_state.get("smgr_df")
+                _mmeta = st.session_state.get("smgr_meta", {})
+                if _mdf is None:
+                    _mdf, _mmeta = _smm.load_store()
+                    if _mdf is not None:
+                        st.session_state["smgr_df"] = _mdf
+                        st.session_state["smgr_meta"] = _mmeta
+            except Exception as _e:
+                _mdf, _mmeta = None, {}
+                st.error(f"マスタの読み込みに失敗しました: {_e}")
+            if _mdf is None:
+                st.warning("サイトマップマスタが未登録です。先に「🗂️ サイトマップ管理」で"
+                           "コンテンツ管理表を取り込んでください。")
+                bg_cfg["urls"] = []
+            else:
+                _urls = [str(u) for u in _mdf[_smm.URL_COL_NAME].dropna().tolist()
+                         if str(u).startswith("http")]
+                if st.checkbox("アプリURLを除く（静的HTMLのみ）", value=False,
+                               key="bg_m_static_only"):
+                    _urls = [u for u in _urls
+                             if _smm.classify_url(u) == "HTML（静的）"]
+                _pf = st.text_input("パス制限（任意）", value="", placeholder="/carlineup/",
+                                    key="bg_m_path_filter").strip()
+                if _pf:
+                    _urls = [u for u in _urls
+                             if u.replace("https://toyota.jp", "").startswith(_pf)]
+                _urls = list(dict.fromkeys(_urls))
+                bg_cfg["urls"] = _urls
+                st.caption(f"✅ マスタ {len(_urls)} 件を対象にします"
+                           f"（最終更新: {_mmeta.get('last_updated', 'ー')}）")
+            bg_cfg["max_pages"] = len(bg_cfg["urls"])
+            bg_cfg["depth"] = 0
+        elif _bg_url_src.startswith("🕷"):
             bg_cfg["url_source_type"] = "crawl"
             bg_cfg["start_url"] = st.text_input("開始URL", value="https://toyota.jp/")
             bg_cfg["max_pages"] = st.slider("最大収集ページ数", 10, 1000, 100)
@@ -429,7 +468,10 @@ if check_type == "🕷️ バックグラウンドクロール":
             if bg_cfg.get("path_filter"):
                 _rows.append(("パス制限", bg_cfg["path_filter"]))
         else:
-            _rows.append(("URL取得方法", "コンテンツ管理票（Excel）"))
+            _src = st.session_state.get("bg_url_src", "")
+            _rows.append(("URL取得方法",
+                          "サイトマップマスタ（アプリ内保持）" if _src.startswith("🗂")
+                          else "コンテンツ管理票（Excel）"))
             _rows.append(("対象URL数", f'{len(bg_cfg.get("urls", []))} 件'))
         _rows.append(("toyota.jpのみ", "はい" if bg_cfg.get("toyota_only") else "いいえ"))
         _rows.append(("実行するチェック",
@@ -445,7 +487,8 @@ if check_type == "🕷️ バックグラウンドクロール":
         st.table(pd.DataFrame(_rows, columns=["項目", "設定値"]).set_index("項目"))
         if run_btn:  # サイドバーの「▶ チェック実行」= ジョブ開始
             if bg_cfg.get("url_source_type") == "excel" and not bg_cfg.get("urls"):
-                st.error("コンテンツ管理票のExcelをアップロードしてください。")
+                st.error("対象URLが0件です。サイトマップマスタの登録（🗂️ サイトマップ管理）"
+                         "またはコンテンツ管理票のアップロードを確認してください。")
             else:
                 try:
                     jid = _cw.start_job(bg_cfg)
