@@ -119,7 +119,8 @@ with st.sidebar:
         "チェック種別",
         ["📄 タイトル取得", "🔗 リンクチェック", "🌐 外部リンクチェック",
          "📌 リンク元調査", "⚡ Core Web Vitals", "📝 表記ゆれ・禁止表現",
-         "🔍 アプリ・機能検出", "🕷️ バックグラウンドクロール", "📖 マニュアル"],
+         "🔍 アプリ・機能検出", "🗂️ サイトマップ管理",
+         "🕷️ バックグラウンドクロール", "📖 マニュアル"],
         index=0,
     )
 
@@ -217,6 +218,23 @@ with st.sidebar:
         url_source = None
         uploaded_file = None
         manual_urls: list = []
+        crawl_start = ""
+        crawl_max = 100
+        crawl_depth = 2
+        limit = 0
+        toyota_only = False
+        selected_res_types: set = set()
+        custom_dict_raw = ""
+        strategy = "mobile"
+        psi_key = st.secrets.get("PSI_API_KEY", "")
+
+    elif check_type == "🗂️ サイトマップ管理":
+        # ── サイトマップ管理: URLソースUIは不要（本体側で完結） ──────────
+        st.divider()
+        st.caption("メイン画面でコンテンツ管理表をアップロードしてください。")
+        url_source = None
+        uploaded_file = None
+        manual_urls = []
         crawl_start = ""
         crawl_max = 100
         crawl_depth = 2
@@ -373,7 +391,19 @@ with st.sidebar:
             psi_key = st.secrets.get("PSI_API_KEY", "")
 
     st.divider()
-    run_btn = st.button("▶ チェック実行", type="primary", use_container_width=True)
+    if check_type == "🗂️ サイトマップ管理":
+        run_btn = False
+    else:
+        run_btn = st.button("▶ チェック実行", type="primary", use_container_width=True)
+
+# ─── サイトマップ管理 UI（常時表示 / 通常フローをスキップ） ──────────
+if check_type == "🗂️ サイトマップ管理":
+    try:
+        import sitemap_manager as _sm
+        _sm.render()
+    except Exception as _e:
+        st.error(f"サイトマップ管理の読み込みに失敗しました: {_e}")
+    st.stop()
 
 # ─── バックグラウンドクロール UI（常時表示 / 通常フローをスキップ） ──
 if check_type == "🕷️ バックグラウンドクロール":
