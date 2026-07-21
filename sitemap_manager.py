@@ -345,6 +345,90 @@ def build_tree(dfd: pd.DataFrame, level: int) -> pd.DataFrame:
     return shown[[c for c in cols if c in shown.columns]]
 
 
+ADD_DATE_COL = "追加日"
+ADD_SRC_COL = "追加元"
+ORPHAN_JSON = STORE_DIR / "orphan_history.json"
+
+
+def ensure_mgmt_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """追加日・追加元の管理列を用意し、既存の転記元表記から日付を復元する。"""
+    out = df.copy()
+    for c in (ADD_DATE_COL, ADD_SRC_COL):
+        if c not in out.columns:
+            out[c] = pd.NA
+    src_col = next((c for c in out.columns
+                    if "転記元" in c and c != ADD_SRC_COL), None)
+    if src_col:
+        for i, v in out[src_col].items():
+            m = re.match(r"クロール検知\s*(\d{4}-\d{2}-\d{2})", str(v or ""))
+            if m and pd.isna(out.at[i, ADD_DATE_COL]):
+                out.at[i, ADD_DATE_COL] = m.group(1)
+                out.at[i, ADD_SRC_COL] = "クロール検知"
+    return out
+
+
+def load_orphan_history() -> list[dict]:
+    if ORPHAN_JSON.exists():
+        try:
+            return json.loads(ORPHAN_JSON.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+    return []
+
+
+def save_orphan_run(checked: int, errors: int, orphans: list[str]) -> list[dict]:
+    hist = load_orphan_history()
+    hist.append({"日時": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                 "巡回数": checked, "取得失敗": errors, "孤島URL": orphans})
+    hist = hist[-20:]
+    STORE_DIR.mkdir(exist_ok=True)
+    ORPHAN_JSON.write_text(json.dumps(hist, ensure_ascii=False), encoding="utf-8")
+    return hist
+
+
+def diff_orphans(prev: list[str], cur: list[str]) -> tuple[list[str], list[str]]:
+    """(新たに孤島になった, 孤島でなくなった)"""
+    p, c = set(prev), set(cur)
+    return sorted(c - p), sorted(p - c)
+
+
+def run_orphan_check(master_urls: list[str], fetch_limit: int,
+                     progress_cb=None) -> tuple[dict[str, int], int, int]:
+    """マスタ全ページを巡回し、マスタ内URLごとの被リンク数を集計する。
+
+    返り値: (正規化URL→被リンク数, 巡回ページ数, 取得失敗数)
+    """
+    from fetcher import fetch_html, extract_links
+    from config import REQUEST_DELAY
+
+    norm_map = {norm_url(u): u for u in master_urls}
+    inbound = {n: 0 for n in norm_map}
+    sources = [u for u in master_urls
+               if not str(u).lower().endswith(FILE_EXTS)][:fetch_limit]
+    errors = 0
+    for i, u in enumerate(sources, 1):
+        if progress_cb:
+            progress_cb(i, len(sources), u)
+        try:
+            status, html = fetch_html(u)
+        except Exception:
+            errors += 1
+            continue
+        if status != 200 or not html:
+            errors += 1
+            continue
+        try:
+            links = extract_links(html, u)
+        except Exception:
+            continue
+        self_n = norm_url(u)
+        for link in set(norm_url(l) for l in links):
+            if link in inbound and link != self_n:
+                inbound[link] += 1
+        time.sleep(REQUEST_DELAY)
+    return inbound, len(sources), errors
+
+
 def to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8-sig")
 
@@ -604,8 +688,9 @@ def render():
                 if a1.button("➕ チェックした行を一覧に追加", type="primary",
                              key="smgr_add_btn"):
                     add = sel[sel["追加"]]
-                    base = df.copy()
-                    src_col = next((c for c in base.columns if "転記元" in c), None)
+                    base = ensure_mgmt_cols(df)
+                    src_col = next((c for c in base.columns
+                                    if "転記元" in c and c != ADD_SRC_COL), None)
                     rows = []
                     for _, r in add.iterrows():
                         row = {c: None for c in base.columns}
@@ -614,6 +699,8 @@ def render():
                             row["ページ説明"] = r["ページ説明"]
                         if src_col:
                             row[src_col] = f"クロール検知 {date.today()}"
+                        row[ADD_DATE_COL] = str(date.today())
+                        row[ADD_SRC_COL] = "クロール検知"
                         rows.append(row)
                     base = pd.concat([base, pd.DataFrame(rows)], ignore_index=True)
                     meta2, dest, gh_err = save_store(base, f"クロール検知 {len(rows)}件追加")
@@ -631,3 +718,112 @@ def render():
                 a2.download_button("⬇️ 検知結果をCSV", to_csv_bytes(nd.drop(columns=['追加'])),
                                    f"crawl_new_urls_{date.today()}.csv", "text/csv",
                                    key="smgr_new_csv")
+
+    # ── 7. 追加URLの差分管理 ──
+    with st.expander("📅 追加URLの差分管理（クロール検知で増えた行）", expanded=False):
+        dm = ensure_mgmt_cols(df)
+        added = dm[dm[ADD_SRC_COL].notna()]
+        if added.empty:
+            st.info("クロール検知で追加されたURLはまだありません。")
+        else:
+            bydate = (added.groupby(ADD_DATE_COL).size()
+                      .rename("追加件数").reset_index()
+                      .sort_values(ADD_DATE_COL, ascending=False))
+            st.dataframe(bydate, hide_index=True, use_container_width=True)
+            days = st.multiselect("追加日で絞り込み",
+                                  sorted(added[ADD_DATE_COL].dropna().unique(),
+                                         reverse=True),
+                                  key="smgr_diff_days")
+            shown = added if not days else added[added[ADD_DATE_COL].isin(days)]
+            cols = [c for c in ("№", URL_COL_NAME, "ページ説明",
+                                ADD_DATE_COL, ADD_SRC_COL) if c in shown.columns]
+            view2 = shown[cols].copy()
+            view2.insert(0, "取り消し", False)
+            sel2 = st.data_editor(view2, use_container_width=True, height=300,
+                                  key="smgr_diff_editor",
+                                  disabled=[c for c in view2.columns if c != "取り消し"])
+            b1, b2 = st.columns([1, 2])
+            if b1.button("🗑️ チェックした行をマスタから削除", key="smgr_diff_del"):
+                drop_idx = sel2[sel2["取り消し"]].index
+                if len(drop_idx):
+                    base = ensure_mgmt_cols(df).drop(index=drop_idx).reset_index(drop=True)
+                    meta2, dest, gh_err = save_store(
+                        base, f"差分管理で削除 {len(drop_idx)}件")
+                    st.session_state["smgr_df"] = base
+                    st.session_state["smgr_meta"] = meta2
+                    st.session_state["smgr_flash"] = \
+                        f"{len(drop_idx)} 件をマスタから削除しました（{dest}）"
+                    if gh_err:
+                        st.session_state["smgr_flash_warn"] = \
+                            f"GitHubバックアップは失敗しました: {gh_err}"
+                    st.rerun()
+            b2.download_button("⬇️ 追加分をCSV", to_csv_bytes(shown[cols]),
+                               f"added_urls_{date.today()}.csv", "text/csv",
+                               key="smgr_diff_csv")
+
+    # ── 8. 陸の孤島チェック ──
+    with st.expander("🏝️ 陸の孤島チェック（どこからもリンクされていないページ）",
+                     expanded=False):
+        st.caption("マスタの各ページを巡回してリンクを収集し、マスタ内のどのページからも"
+                   "リンクされていないURL（陸の孤島）を検出します。"
+                   "※ JavaScriptで動的に生成されるリンクは検出できないため、"
+                   "孤島判定は【要検証】として扱ってください。")
+        o1, o2 = st.columns([1, 2])
+        fetch_limit = o1.number_input("巡回ページ数の上限", 50, 30000,
+                                      min(len(df), 1000), step=50,
+                                      key="smgr_o_limit")
+        o2.caption(f"目安時間: 約{int(fetch_limit) * 0.5 / 60:.0f}分"
+                   "（1ページ約0.5秒）。上限をマスタ件数以上にすると全ページ巡回。")
+        if st.button("▶ 孤島チェック実行", key="smgr_o_run"):
+            urls = [str(u) for u in df[URL_COL_NAME].dropna()
+                    if str(u).startswith("http")]
+            bar = st.progress(0.0)
+            info = st.empty()
+            inbound, checked, errors = run_orphan_check(
+                urls, int(fetch_limit),
+                lambda i, n, u: (bar.progress(i / n),
+                                 info.caption(f"{i}/{n} 巡回中… {u[:80]}")))
+            nm = {norm_url(u): u for u in urls}
+            orphans = [nm[k] for k, v in inbound.items() if v == 0]
+            hist = save_orphan_run(checked, errors, orphans)
+            st.session_state["smgr_orphan"] = {
+                "inbound": {nm[k]: v for k, v in inbound.items()},
+                "orphans": orphans, "checked": checked, "errors": errors,
+                "hist": hist}
+            bar.progress(1.0)
+
+        res = st.session_state.get("smgr_orphan")
+        if res is None:
+            hist = load_orphan_history()
+            if hist:
+                last = hist[-1]
+                st.caption(f"前回実行: {last['日時']}（巡回{last['巡回数']}件・"
+                           f"孤島{len(last['孤島URL'])}件）")
+        else:
+            m1, m2, m3 = st.columns(3)
+            m1.metric("巡回ページ数", res["checked"])
+            m2.metric("🏝️ 孤島URL", len(res["orphans"]))
+            m3.metric("取得失敗", res["errors"])
+            hist = res["hist"]
+            if len(hist) >= 2:
+                new_o, fixed_o = diff_orphans(hist[-2]["孤島URL"], res["orphans"])
+                st.caption(f"前回（{hist[-2]['日時']}）との差分: "
+                           f"新たに孤島 {len(new_o)}件 ／ 解消 {len(fixed_o)}件")
+                if new_o:
+                    st.error("🆕 新たに孤島になったURL:\n" +
+                             "\n".join(f"- {u}" for u in new_o[:20]))
+                if fixed_o:
+                    st.success("✅ 孤島が解消されたURL:\n" +
+                               "\n".join(f"- {u}" for u in fixed_o[:20]))
+            od = dfd[[URL_COL_NAME, "ページ説明", "種別判定"]].copy()
+            od["被リンク数"] = od[URL_COL_NAME].map(
+                lambda u: res["inbound"].get(str(u), pd.NA))
+            od["判定"] = od["被リンク数"].map(
+                lambda v: "🏝️ 孤島" if v == 0 else ("" if pd.isna(v) else "リンクあり"))
+            only_o = st.checkbox("孤島のみ表示", value=True, key="smgr_o_only")
+            show = od[od["判定"] == "🏝️ 孤島"] if only_o else od
+            st.dataframe(show.sort_values("被リンク数", na_position="last"),
+                         use_container_width=True, height=360, hide_index=True)
+            st.download_button("⬇️ 孤島チェック結果をCSV", to_csv_bytes(od),
+                               f"orphan_check_{date.today()}.csv", "text/csv",
+                               key="smgr_o_csv")
