@@ -314,13 +314,16 @@ def build_tree(dfd: pd.DataFrame, level: int) -> pd.DataFrame:
     d["_segs"] = d[URL_COL_NAME].map(lambda u: tuple(s for s in path_levels(u) if s))
     d = d.sort_values("_segs", kind="stable").reset_index(drop=True)
 
-    # 配下ページ数: 自分のパスを接頭辞とする行数（自分を除く）
+    # 配下ページ数: 自分のパスを接頭辞とする行数（自分を除く）。
+    # 接頭辞カウントで O(n×階層) — 3万行規模でも高速
+    from collections import Counter
     seg_list = list(d["_segs"])
-    counts = []
+    prefix_counts: Counter = Counter()
+    exact_counts: Counter = Counter(seg_list)
     for segs in seg_list:
-        n = sum(1 for o in seg_list if len(o) > len(segs) and o[:len(segs)] == segs)
-        counts.append(n)
-    d["配下ページ数"] = counts
+        for i in range(0, len(segs) + 1):
+            prefix_counts[segs[:i]] += 1
+    d["配下ページ数"] = [prefix_counts[s] - exact_counts[s] for s in seg_list]
 
     shown = d[d["階層深さ"] <= level].copy()
 
@@ -357,6 +360,17 @@ def to_excel_bytes(df: pd.DataFrame) -> bytes:
 
 VIEW_COLS = ["№", URL_COL_NAME, "ページ説明", "種別判定", "階層深さ",
              "運用対象コンテンツ", "更新頻度", "情報主幹部署", "運用会社", "アプリ"]
+
+
+def _cached_derived_impl(_df: pd.DataFrame, ver) -> pd.DataFrame:
+    return add_derived(_df)
+
+
+try:  # マスタ更新時のみ再計算（ver がキー。_df はハッシュ対象外）
+    import streamlit as _st
+    _cached_derived = _st.cache_data(show_spinner=False)(_cached_derived_impl)
+except Exception:  # pragma: no cover
+    _cached_derived = _cached_derived_impl
 
 
 def render():
@@ -426,7 +440,9 @@ def render():
             st.dataframe(pd.DataFrame(list(reversed(hist))[:10]),
                          use_container_width=True, hide_index=True)
 
-    dfd = add_derived(df)
+    # 派生列はマスタ更新時のみ再計算（3万行規模対応）
+    _ver = (meta.get("last_updated", ""), len(df))
+    dfd = _cached_derived(df, _ver)
 
     # ── 2. サマリー ──
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -499,13 +515,21 @@ def render():
                            f"sitemap_tree_level{level}_{date.today()}.csv", "text/csv",
                            key="smgr_tree_csv")
     else:
-        show_all = st.checkbox("全列を表示（Excelの全項目）", key="smgr_allcols")
+        pc1, pc2, pc3 = st.columns([1, 1, 2])
+        show_all = pc3.checkbox("全列を表示（Excelの全項目）", key="smgr_allcols")
+        page_size = pc1.selectbox("1ページの行数", [200, 500, 1000, 2000], index=1,
+                                  key="smgr_psize")
+        n_pages = max(1, -(-len(view) // page_size))
+        page = pc2.number_input(f"ページ（全{n_pages}ページ）", 1, n_pages, 1,
+                                key="smgr_page")
+        pview = view.iloc[(page - 1) * page_size: page * page_size]
         lvl_cols = [f"階層{i + 1}" for i in range(level)]
         cols = ([c for c in VIEW_COLS if c in view.columns] + lvl_cols) if not show_all \
             else list(view.columns)
-        st.subheader(f"一覧編集（{len(view)} 件）")
+        st.subheader(f"一覧編集（{len(view)} 件中 "
+                     f"{(page - 1) * page_size + 1}〜{(page - 1) * page_size + len(pview)} 件目）")
         edited = st.data_editor(
-            view[cols], use_container_width=True, height=480,
+            pview[cols], use_container_width=True, height=480,
             num_rows="dynamic", key="smgr_editor",
             disabled=["種別判定", "階層深さ"] + lvl_cols,
         )
@@ -513,9 +537,9 @@ def render():
             base = df.copy()
             editable = [c for c in edited.columns
                         if c in base.columns and c not in ("種別判定", "階層深さ")]
-            common = edited.index.intersection(base.index)
+            common = edited.index.intersection(pview.index)
             base.loc[common, editable] = edited.loc[common, editable]
-            new_rows = edited.loc[edited.index.difference(base.index), editable]
+            new_rows = edited.loc[edited.index.difference(pview.index), editable]
             new_rows = new_rows[new_rows[URL_COL_NAME].notna()]
             if len(new_rows):
                 base = pd.concat([base, new_rows], ignore_index=True)
